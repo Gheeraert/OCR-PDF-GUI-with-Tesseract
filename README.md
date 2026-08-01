@@ -16,15 +16,17 @@ Scripts :
 
 ## ✨ Fonctionnalités
 
-- **Interface graphique** simple (sélection du PDF & du dossier de sortie).
+- **Interface graphique** simple (sélection de la source & du dossier de sortie).
+- **Deux sources d'entrée** : un **PDF scanné**, ou directement un **dossier de photos** (JPG/PNG/TIFF/BMP/WEBP, triées par ordre naturel de nom de fichier) — pratique pour des pages photographiées au smartphone sans passer par une app de scan tierce.
 - **OCR Tesseract** via `pytesseract` et rendu PDF → image avec **PyMuPDF**.
 - **Sorties** : `.txt`, `.docx`, **PDF interrogeable** (texte copiable/recherchable).
 - **Doubles pages** :
   - Mode **auto** (détection de la **gouttière** : seuillage Otsu + projection verticale lissée).
   - Mode **half** (50/50) en secours.
-  - **Aperçu** de la coupe sur la première page (ligne rouge) pour ajuster avant OCR.
+  - **Aperçu** de la coupe sur la première page/photo (ligne rouge) pour ajuster avant OCR.
 - **Réglages** : langues Tesseract (`fra`, `eng`, `fra+eng`…), **DPI**, plage de pages, **config Tesseract** (`--oem`, `--psm`), sauts de page, etc.
-- **Prétraitement** automatique léger (niveaux + médiane) pour améliorer l’OCR.
+- **Prétraitement** automatique léger (niveaux + médiane) pour améliorer l’OCR sur des scans propres.
+- **Mode photo (smartphone)** optionnel : corrige un éclairage non uniforme (flat-fielding par soustraction d'un flou gaussien large), redresse une inclinaison fine (deskew, recherche d'angle par variance de projection) et applique un **seuillage adaptatif** local — plus robuste qu'un simple contraste global pour des photos prises à main levée.
 - Bouton **“Ouvrir le dossier”** en fin de traitement.
 
 ---
@@ -116,13 +118,26 @@ C:\Program Files\Tesseract-OCR\
 python ocr_pdf_gui.py
 ```
 
-1. **Choisir un PDF** et un **dossier de sortie**.  
-2. Régler **Langues**, **DPI**, **Config Tesseract**, **Plage de pages**.  
+1. **Choisir la source** : un **fichier PDF**, ou un **dossier de photos** (JPG/PNG…), et un **dossier de sortie**.  
+2. Régler **Langues**, **DPI** (PDF uniquement), **Config Tesseract**, **Plage de pages**.  
 3. (Optionnel) Cocher **PDF interrogeable**.  
 4. (Si besoin) **Couper les doubles pages** (voir ci-dessous) et lancer **Aperçu découpe (p.1)**.  
-5. **Démarrer l’OCR**.
+5. Pour des **photos prises au smartphone** : activer **Mode photo** (voir ci-dessous).  
+6. **Démarrer l’OCR**.
 
-Sorties : `NOMDUFICHIER_OCR.txt`, `NOMDUFICHIER_OCR.docx` et/ou `NOMDUFICHIER_OCR.pdf`.
+Sorties : `NOM_OCR.txt`, `NOM_OCR.docx` et/ou `NOM_OCR.pdf` (`NOM` = nom du PDF, ou nom du dossier de photos).
+
+---
+
+## 📸 Mode photo (smartphone)
+
+Quand la source est un **dossier de photos**, le **Mode photo** se coche automatiquement (modifiable). Il remplace le prétraitement standard (contraste global + médiane) par trois étapes pensées pour une photo prise à main levée :
+
+1. **Redressement (deskew)** : recherche l'angle (± *Inclinaison max.*, réglable, 5° par défaut) qui aligne le mieux les lignes de texte, par variance des projections horizontales.
+2. **Correction d'éclairage** : divise l'image par une version très floutée d'elle-même (*flat-fielding*) pour atténuer un gradient de lumière (ombre de la main, fenêtre d'un côté).
+3. **Seuillage adaptatif** : binarise par comparaison à une moyenne locale plutôt qu'un seuil global (Otsu), plus robuste si l'éclairage reste légèrement inégal après l'étape 2.
+
+**Limites connues** (non traitées par ce mode) : la **correction de perspective/courbure** de reliure (page qui se creuse près du pli) n'est pas corrigée — si vos photos sont très déformées, une app de scan mobile en amont (recadrage + correction de perspective) donnera de meilleurs résultats que ce plugin seul.
 
 ---
 

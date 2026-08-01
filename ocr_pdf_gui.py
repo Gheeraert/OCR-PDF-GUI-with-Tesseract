@@ -139,6 +139,77 @@ def split_double_page(img, mode="auto", central_frac=0.4, smooth_px=25):
     return [left, right]
 
 
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp")
+
+
+def natural_sort_key(s):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
+
+
+def list_images_in_folder(folder):
+    names = [n for n in os.listdir(folder) if n.lower().endswith(IMAGE_EXTENSIONS)]
+    names.sort(key=natural_sort_key)
+    return [os.path.join(folder, n) for n in names]
+
+
+def normalize_illumination(gray_img, blur_radius=31):
+    """Corrige un éclairage non uniforme (ombre portée, gradient de fenêtre)
+    en divisant l'image par une version très floutée d'elle-même (flat-fielding)."""
+    import numpy as np
+    arr = np.asarray(gray_img, dtype=np.float32)
+    bg = np.asarray(gray_img.filter(ImageFilter.GaussianBlur(radius=blur_radius)), dtype=np.float32)
+    bg[bg < 1.0] = 1.0
+    norm = np.clip(arr / bg * 255.0, 0, 255).astype(np.uint8)
+    return Image.fromarray(norm, mode="L")
+
+
+def adaptive_threshold(gray_img, blur_radius=15, offset=10):
+    """Seuillage adaptatif (comparaison à une moyenne locale) : plus robuste qu'un
+    seuil Otsu global face à un éclairage encore légèrement inégal après normalisation."""
+    import numpy as np
+    arr = np.asarray(gray_img, dtype=np.float32)
+    local_mean = np.asarray(gray_img.filter(ImageFilter.BoxBlur(blur_radius)), dtype=np.float32)
+    binary = np.where(arr > (local_mean - offset), 255, 0).astype(np.uint8)
+    return Image.fromarray(binary, mode="L")
+
+
+def estimate_skew_angle(gray_img, max_angle=5.0, step=0.5):
+    """Cherche l'angle (dans [-max_angle, +max_angle]) qui maximise la variance des
+    projections horizontales — plus l'image est droite, plus les lignes de texte
+    forment des bandes nettes (forte variance de la somme d'encre par ligne)."""
+    import numpy as np
+    small = gray_img
+    max_dim = 1000
+    if max(small.size) > max_dim:
+        scale = max_dim / max(small.size)
+        small = small.resize((max(1, int(small.width * scale)), max(1, int(small.height * scale))))
+    arr = np.asarray(small, dtype=np.float32)
+    bw = (arr < arr.mean()).astype(np.uint8) * 255
+    bw_img = Image.fromarray(bw, mode="L")
+
+    best_angle, best_score = 0.0, -1.0
+    angle = -abs(max_angle)
+    while angle <= abs(max_angle) + 1e-9:
+        rotated = bw_img.rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor=0)
+        row_sums = np.asarray(rotated, dtype=np.float32).sum(axis=1)
+        score = float(row_sums.var())
+        if score > best_score:
+            best_score, best_angle = score, angle
+        angle += step
+    return best_angle
+
+
+def deskew_image(img, max_angle=5.0, step=0.5):
+    """Redresse une image inclinée de quelques degrés (photo prise à main levée)."""
+    gray = img.convert("L") if img.mode != "L" else img
+    angle = estimate_skew_angle(gray, max_angle=max_angle, step=step)
+    if abs(angle) < 0.05:
+        return img, 0.0
+    fill = 255 if img.mode == "L" else (255, 255, 255)
+    rotated = img.rotate(angle, resample=Image.BICUBIC, expand=True, fillcolor=fill)
+    return rotated, angle
+
+
 def postprocess_text(txt: str) -> str:
     txt = txt.replace("\r\n", "\n").replace("\r", "\n")
     txt = re.sub(r"(\w)[\-­]\n(\w)", r"\1\2", txt)
@@ -156,7 +227,9 @@ class OCRApp(tk.Tk):
         self.geometry("880x700")
         self.minsize(860, 680)
 
+        self.input_mode_var = tk.StringVar(value="pdf")  # "pdf" ou "images"
         self.pdf_path_var = tk.StringVar()
+        self.image_dir_var = tk.StringVar()
         self.out_dir_var = tk.StringVar()
         self.lang_var = tk.StringVar(value="fra+eng")
         self.res_dpi_var = tk.IntVar(value=300)
@@ -173,21 +246,42 @@ class OCRApp(tk.Tk):
         self.central_frac_var = tk.DoubleVar(value=0.4)   # 40% du centre
         self.smooth_px_var = tk.IntVar(value=25)
 
+        # Prétraitement "photo smartphone"
+        self.photo_mode_var = tk.BooleanVar(value=False)
+        self.max_skew_var = tk.DoubleVar(value=5.0)
+
         self._worker = None
         self._cancel_event = threading.Event()
         self._ui_queue = queue.Queue()
         self._build_ui()
+        self._on_input_mode_change()
         self._poll_queue()
 
     def _build_ui(self):
         pad = {'padx': 10, 'pady': 6}
         frm = ttk.Frame(self); frm.pack(fill="both", expand=True)
 
-        # Ligne PDF
+        # Source d'entrée : PDF ou dossier de photos
+        row0 = ttk.Frame(frm); row0.pack(fill="x", **pad)
+        ttk.Label(row0, text="Source :").pack(side="left")
+        ttk.Radiobutton(row0, text="Fichier PDF", variable=self.input_mode_var, value="pdf",
+                         command=self._on_input_mode_change).pack(side="left", padx=(8, 4))
+        ttk.Radiobutton(row0, text="Dossier de photos (JPG/PNG…)", variable=self.input_mode_var, value="images",
+                         command=self._on_input_mode_change).pack(side="left", padx=4)
+
         row1 = ttk.Frame(frm); row1.pack(fill="x", **pad)
-        ttk.Label(row1, text="Fichier PDF :").pack(side="left")
-        ttk.Entry(row1, textvariable=self.pdf_path_var).pack(side="left", fill="x", expand=True, padx=8)
-        ttk.Button(row1, text="Parcourir…", command=self._browse_pdf).pack(side="left")
+        self.pdf_label = ttk.Label(row1, text="Fichier PDF :"); self.pdf_label.pack(side="left")
+        self.pdf_entry = ttk.Entry(row1, textvariable=self.pdf_path_var)
+        self.pdf_entry.pack(side="left", fill="x", expand=True, padx=8)
+        self.pdf_browse_btn = ttk.Button(row1, text="Parcourir…", command=self._browse_pdf)
+        self.pdf_browse_btn.pack(side="left")
+
+        row1b = ttk.Frame(frm); row1b.pack(fill="x", **pad)
+        self.imgdir_label = ttk.Label(row1b, text="Dossier de photos :"); self.imgdir_label.pack(side="left")
+        self.imgdir_entry = ttk.Entry(row1b, textvariable=self.image_dir_var)
+        self.imgdir_entry.pack(side="left", fill="x", expand=True, padx=8)
+        self.imgdir_browse_btn = ttk.Button(row1b, text="Parcourir…", command=self._browse_image_dir)
+        self.imgdir_browse_btn.pack(side="left")
 
         # Dossier sortie
         row2 = ttk.Frame(frm); row2.pack(fill="x", **pad)
@@ -223,6 +317,19 @@ class OCRApp(tk.Tk):
         ttk.Label(row4b, text="Lissage (px) :").grid(row=1, column=3, sticky="e")
         ttk.Spinbox(row4b, from_=5, to=101, increment=2, textvariable=self.smooth_px_var, width=6).grid(row=1, column=4, sticky="w")
         ttk.Button(row4b, text="Aperçu découpe (p.1)", command=self.preview_cut).grid(row=0, column=3, columnspan=2, padx=12)
+
+        # Prétraitement photo smartphone
+        row4c = ttk.LabelFrame(frm, text="Prétraitement photo (smartphone)"); row4c.pack(fill="x", **pad)
+        ttk.Checkbutton(
+            row4c, text="Mode photo (correction d’éclairage + redressement + seuillage adaptatif)",
+            variable=self.photo_mode_var,
+        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=4)
+        ttk.Label(row4c, text="Inclinaison max. corrigée (°) :").grid(row=1, column=0, sticky="w", padx=8)
+        ttk.Spinbox(row4c, from_=1, to=15, increment=1, textvariable=self.max_skew_var, width=6).grid(row=1, column=1, sticky="w")
+        ttk.Label(
+            row4c,
+            text="Recommandé pour des photos prises à main levée (à la place du simple contraste/médiane).",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
 
         # Progression
         row5 = ttk.Frame(frm); row5.pack(fill="x", **pad)
@@ -280,10 +387,26 @@ class OCRApp(tk.Tk):
         else:
             self.set_status("Aucun traitement en cours.")
 
+    def _on_input_mode_change(self):
+        images_mode = self.input_mode_var.get() == "images"
+        state_pdf = "disabled" if images_mode else "normal"
+        state_img = "normal" if images_mode else "disabled"
+        self.pdf_entry.configure(state=state_pdf)
+        self.pdf_browse_btn.configure(state=state_pdf)
+        self.imgdir_entry.configure(state=state_img)
+        self.imgdir_browse_btn.configure(state=state_img)
+        if images_mode:
+            self.photo_mode_var.set(True)
+
     def _browse_pdf(self):
         path = filedialog.askopenfilename(title="Choisir un PDF", filetypes=[("PDF", "*.pdf"), ("Tous les fichiers", "*.*")])
         if path:
             self.pdf_path_var.set(path); self.out_dir_var.set(os.path.dirname(path))
+
+    def _browse_image_dir(self):
+        d = filedialog.askdirectory(title="Choisir un dossier de photos")
+        if d:
+            self.image_dir_var.set(d); self.out_dir_var.set(d)
 
     def _browse_outdir(self):
         d = filedialog.askdirectory(title="Choisir un dossier de sortie")
@@ -314,17 +437,30 @@ class OCRApp(tk.Tk):
                 if 0 <= i < nb_pages: indices.add(i)
         return sorted(indices)
 
-    def preview_cut(self):
-        pdf_path = self.pdf_path_var.get().strip()
-        if not pdf_path or not os.path.isfile(pdf_path):
-            messagebox.showerror("Erreur", "Choisis d'abord un PDF."); return
-        try:
+    def _load_first_page_image(self):
+        """Retourne la première page/photo sous forme d'image PIL, selon la source active."""
+        if self.input_mode_var.get() == "images":
+            image_dir = self.image_dir_var.get().strip()
+            if not image_dir or not os.path.isdir(image_dir):
+                raise ValueError("Choisis d'abord un dossier de photos.")
+            paths = list_images_in_folder(image_dir)
+            if not paths:
+                raise ValueError("Aucune image (JPG/PNG/…) trouvée dans ce dossier.")
+            return Image.open(paths[0]).convert("RGB")
+        else:
+            pdf_path = self.pdf_path_var.get().strip()
+            if not pdf_path or not os.path.isfile(pdf_path):
+                raise ValueError("Choisis d'abord un PDF.")
             doc = fitz.open(pdf_path)
             page = doc.load_page(0)
             dpi = int(self.res_dpi_var.get())
             zoom = dpi / 72.0; mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            img = pil_from_fitz_pixmap(pix)
+            return pil_from_fitz_pixmap(pix)
+
+    def preview_cut(self):
+        try:
+            img = self._load_first_page_image()
             if self.split_mode_var.get() == "half":
                 gx = img.width // 2
             else:
@@ -346,9 +482,16 @@ class OCRApp(tk.Tk):
     def start_ocr(self):
         if self._worker and self._worker.is_alive():
             messagebox.showinfo("En cours", "Un traitement est déjà en cours."); return
+        images_mode = self.input_mode_var.get() == "images"
         pdf_path = self.pdf_path_var.get().strip()
+        image_dir = self.image_dir_var.get().strip()
         out_dir = self.out_dir_var.get().strip()
-        if not pdf_path or not os.path.isfile(pdf_path):
+        if images_mode:
+            if not image_dir or not os.path.isdir(image_dir):
+                messagebox.showerror("Erreur", "Veuillez choisir un dossier de photos valide."); return
+            if not list_images_in_folder(image_dir):
+                messagebox.showerror("Erreur", "Aucune image (JPG/PNG/…) trouvée dans ce dossier."); return
+        elif not pdf_path or not os.path.isfile(pdf_path):
             messagebox.showerror("Erreur", "Veuillez choisir un PDF valide."); return
         if not out_dir or not os.path.isdir(out_dir):
             messagebox.showerror("Erreur", "Veuillez choisir un dossier de sortie valide."); return
@@ -368,7 +511,11 @@ class OCRApp(tk.Tk):
 
         self.log.delete("1.0", "end"); self.progress["value"] = 0
         self.set_status("Préparation…")
-        self.logln(f"PDF : {pdf_path}"); self.logln(f"Dossier de sortie : {out_dir}"); self.logln(f"Tesseract : {found}")
+        if images_mode:
+            self.logln(f"Dossier de photos : {image_dir}")
+        else:
+            self.logln(f"PDF : {pdf_path}")
+        self.logln(f"Dossier de sortie : {out_dir}"); self.logln(f"Tesseract : {found}")
         self._cancel_event.clear()
         self._worker = threading.Thread(target=self._do_ocr, daemon=True); self._worker.start()
 
@@ -382,23 +529,48 @@ class OCRApp(tk.Tk):
         SAVE_EVERY = 10  # sauvegarde périodique DOCX/PDF pour ne rien perdre en cas de crash/annulation
 
         try:
+            images_mode = self.input_mode_var.get() == "images"
             pdf_path = self.pdf_path_var.get().strip()
+            image_dir = self.image_dir_var.get().strip()
             out_dir = self.out_dir_var.get().strip()
             dpi = int(self.res_dpi_var.get())
             langs = self.lang_var.get().strip() or "fra"
             pr_str = self.page_range_var.get().strip()
             tess_cfg = self.tess_config_var.get().strip()
-            base = os.path.splitext(os.path.basename(pdf_path))[0]
+            photo_mode = bool(self.photo_mode_var.get())
+            max_skew = float(self.max_skew_var.get())
+
+            if images_mode:
+                image_paths = list_images_in_folder(image_dir)
+                nb_pages = len(image_paths)
+                source_label = os.path.basename(image_dir.rstrip("\\/")) or image_dir
+                doc = None
+            else:
+                doc = fitz.open(pdf_path)
+                nb_pages = doc.page_count
+                source_label = os.path.basename(pdf_path)
+
+            def load_page_image(idx):
+                if images_mode:
+                    return Image.open(image_paths[idx]).convert("RGB")
+                page = doc.load_page(idx)
+                zoom = dpi / 72.0; mat = fitz.Matrix(zoom, zoom)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                return pil_from_fitz_pixmap(pix)
+
+            base = os.path.splitext(source_label)[0] if not images_mode else source_label
             txt_out = os.path.join(out_dir, f"{base}_OCR.txt")
             docx_out = os.path.join(out_dir, f"{base}_OCR.docx")
             pdf_out = os.path.join(out_dir, f"{base}_OCR.pdf")
             self._q_put("log", f"Langues Tesseract : {langs}")
-            self._q_put("log", f"Résolution rendu : {dpi} DPI")
+            if images_mode:
+                self._q_put("log", f"{nb_pages} photo(s) trouvée(s)")
+            else:
+                self._q_put("log", f"Résolution rendu : {dpi} DPI")
             self._q_put("log", f"Pages : {pr_str}")
             self._q_put("log", f"Config Tesseract : {tess_cfg or '(par défaut)'}")
+            self._q_put("log", f"Mode photo (éclairage + redressement) : {'oui' if photo_mode else 'non'}")
 
-            doc = fitz.open(pdf_path)
-            nb_pages = doc.page_count
             pages_idx = self._parse_page_ranges(pr_str, nb_pages)
             if not pages_idx: raise ValueError("Aucune page à traiter.")
             self._q_put("progress_max", len(pages_idx))
@@ -413,7 +585,7 @@ class OCRApp(tk.Tk):
                 try:
                     style = docx.styles["Normal"]; font = style.font; font.name = "Calibri"; font.size = Pt(11)
                 except Exception: pass
-                docx.add_heading(f"OCR de {os.path.basename(pdf_path)}", level=1)
+                docx.add_heading(f"OCR de {source_label}", level=1)
                 docx.add_paragraph(f"Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
             if self.format_pdf_var.get():
@@ -428,10 +600,7 @@ class OCRApp(tk.Tk):
                     self._q_put("log", "Traitement annulé par l'utilisateur.")
                     break
 
-                page = doc.load_page(i)
-                zoom = dpi / 72.0; mat = fitz.Matrix(zoom, zoom)
-                pix = page.get_pixmap(matrix=mat, alpha=False)
-                img = pil_from_fitz_pixmap(pix)
+                img = load_page_image(i)
 
                 images_to_ocr = [img]
                 if self.split_doubles_var.get():
@@ -445,7 +614,15 @@ class OCRApp(tk.Tk):
                         self._q_put("log", "Traitement annulé par l'utilisateur.")
                         break
 
-                    proc = sub_img.convert("L"); proc = ImageOps.autocontrast(proc); proc = proc.filter(ImageFilter.MedianFilter(3))
+                    proc = sub_img.convert("L")
+                    if photo_mode:
+                        deskewed, angle = deskew_image(proc, max_angle=max_skew)
+                        if angle:
+                            self._q_put("log", f"[Page {i+1}] Redressement : {angle:+.1f}°")
+                        proc = normalize_illumination(deskewed)
+                        proc = adaptive_threshold(proc)
+                    else:
+                        proc = ImageOps.autocontrast(proc); proc = proc.filter(ImageFilter.MedianFilter(3))
                     try:
                         txt = pytesseract.image_to_string(proc, lang=langs, config=tess_cfg or None)
                     except Exception as e:
