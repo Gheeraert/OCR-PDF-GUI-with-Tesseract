@@ -11,6 +11,7 @@ import io
 import os
 import sys
 import threading
+import queue
 import shutil
 import re
 from datetime import datetime
@@ -173,7 +174,10 @@ class OCRApp(tk.Tk):
         self.smooth_px_var = tk.IntVar(value=25)
 
         self._worker = None
+        self._cancel_event = threading.Event()
+        self._ui_queue = queue.Queue()
         self._build_ui()
+        self._poll_queue()
 
     def _build_ui(self):
         pad = {'padx': 10, 'pady': 6}
@@ -229,6 +233,7 @@ class OCRApp(tk.Tk):
         # Boutons
         row6 = ttk.Frame(frm); row6.pack(fill="x", **pad)
         ttk.Button(row6, text="Démarrer l’OCR", command=self.start_ocr).pack(side="left", padx=4)
+        ttk.Button(row6, text="Annuler", command=self.cancel_ocr).pack(side="left", padx=4)
         ttk.Button(row6, text="Ouvrir le dossier", command=self._open_outdir).pack(side="left", padx=4)
         ttk.Button(row6, text="Quitter", command=self.destroy).pack(side="right", padx=4)
 
@@ -241,6 +246,39 @@ class OCRApp(tk.Tk):
 
     def set_status(self, text):
         self.status_var.set(text); self.update_idletasks()
+
+    # ---- Communication thread-safe avec le worker OCR ----
+    def _q_put(self, kind, payload=None):
+        """Appelé depuis le thread worker : dépose un message pour le thread UI."""
+        self._ui_queue.put((kind, payload))
+
+    def _poll_queue(self):
+        """Tourne sur le thread principal (via .after) et applique les messages du worker."""
+        try:
+            while True:
+                kind, payload = self._ui_queue.get_nowait()
+                if kind == "log":
+                    self.logln(payload)
+                elif kind == "status":
+                    self.set_status(payload)
+                elif kind == "progress_max":
+                    self.progress["maximum"] = payload
+                elif kind == "progress_value":
+                    self.progress["value"] = payload
+                elif kind == "info":
+                    messagebox.showinfo(*payload)
+                elif kind == "error":
+                    messagebox.showerror(*payload)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def cancel_ocr(self):
+        if self._worker and self._worker.is_alive():
+            self._cancel_event.set()
+            self.set_status("Annulation demandée…")
+        else:
+            self.set_status("Aucun traitement en cours.")
 
     def _browse_pdf(self):
         path = filedialog.askopenfilename(title="Choisir un PDF", filetypes=[("PDF", "*.pdf"), ("Tous les fichiers", "*.*")])
@@ -331,9 +369,18 @@ class OCRApp(tk.Tk):
         self.log.delete("1.0", "end"); self.progress["value"] = 0
         self.set_status("Préparation…")
         self.logln(f"PDF : {pdf_path}"); self.logln(f"Dossier de sortie : {out_dir}"); self.logln(f"Tesseract : {found}")
+        self._cancel_event.clear()
         self._worker = threading.Thread(target=self._do_ocr, daemon=True); self._worker.start()
 
     def _do_ocr(self):
+        # Tourne dans un thread worker : toute communication avec l'UI passe
+        # par self._q_put (jamais d'accès direct aux widgets depuis ce thread).
+        txt_file = None
+        docx = None
+        final_pdf = None
+        cancelled = False
+        SAVE_EVERY = 10  # sauvegarde périodique DOCX/PDF pour ne rien perdre en cas de crash/annulation
+
         try:
             pdf_path = self.pdf_path_var.get().strip()
             out_dir = self.out_dir_var.get().strip()
@@ -345,21 +392,42 @@ class OCRApp(tk.Tk):
             txt_out = os.path.join(out_dir, f"{base}_OCR.txt")
             docx_out = os.path.join(out_dir, f"{base}_OCR.docx")
             pdf_out = os.path.join(out_dir, f"{base}_OCR.pdf")
-            self.logln(f"Langues Tesseract : {langs}")
-            self.logln(f"Résolution rendu : {dpi} DPI")
-            self.logln(f"Pages : {pr_str}")
-            self.logln(f"Config Tesseract : {tess_cfg or '(par défaut)'}")
+            self._q_put("log", f"Langues Tesseract : {langs}")
+            self._q_put("log", f"Résolution rendu : {dpi} DPI")
+            self._q_put("log", f"Pages : {pr_str}")
+            self._q_put("log", f"Config Tesseract : {tess_cfg or '(par défaut)'}")
 
             doc = fitz.open(pdf_path)
             nb_pages = doc.page_count
             pages_idx = self._parse_page_ranges(pr_str, nb_pages)
             if not pages_idx: raise ValueError("Aucune page à traiter.")
-            self.progress["maximum"] = len(pages_idx)
-            all_pages_text = []; self.set_status("OCR en cours…")
-            final_pdf = fitz.open() if self.format_pdf_var.get() else None
+            self._q_put("progress_max", len(pages_idx))
+            self._q_put("status", "OCR en cours…")
+
+            if self.format_txt_var.get():
+                txt_file = open(txt_out, "w", encoding="utf-8")
+            txt_first_entry = True
+
+            if self.format_docx_var.get() and Document is not None:
+                docx = Document()
+                try:
+                    style = docx.styles["Normal"]; font = style.font; font.name = "Calibri"; font.size = Pt(11)
+                except Exception: pass
+                docx.add_heading(f"OCR de {os.path.basename(pdf_path)}", level=1)
+                docx.add_paragraph(f"Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+            if self.format_pdf_var.get():
+                final_pdf = fitz.open()
+
             suffixes = "abcdefghijklmnopqrstuvwxyz"
+            processed_sub_pages = 0
 
             for k, i in enumerate(pages_idx, start=1):
+                if self._cancel_event.is_set():
+                    cancelled = True
+                    self._q_put("log", "Traitement annulé par l'utilisateur.")
+                    break
+
                 page = doc.load_page(i)
                 zoom = dpi / 72.0; mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -372,18 +440,41 @@ class OCRApp(tk.Tk):
                                                       smooth_px=int(self.smooth_px_var.get()))
 
                 for sub_idx, sub_img in enumerate(images_to_ocr):
+                    if self._cancel_event.is_set():
+                        cancelled = True
+                        self._q_put("log", "Traitement annulé par l'utilisateur.")
+                        break
+
                     proc = sub_img.convert("L"); proc = ImageOps.autocontrast(proc); proc = proc.filter(ImageFilter.MedianFilter(3))
                     try:
                         txt = pytesseract.image_to_string(proc, lang=langs, config=tess_cfg or None)
                     except Exception as e:
-                        self.logln(f"[Page {i+1}] Erreur OCR: {e}. Fallback 'eng'.")
-                        txt = pytesseract.image_to_string(proc, lang="eng", config=tess_cfg or None)
+                        self._q_put("log", f"[Page {i+1}] Erreur OCR ({langs}) : {e}. Tentative de repli en 'eng'.")
+                        try:
+                            txt = pytesseract.image_to_string(proc, lang="eng", config=tess_cfg or None)
+                        except Exception as e2:
+                            self._q_put("log", f"[Page {i+1}] Échec du repli 'eng' : {e2}. Page laissée vide, poursuite du traitement.")
+                            txt = ""
 
                     txt = postprocess_text(txt)
                     suffix = suffixes[sub_idx] if len(images_to_ocr) > 1 else ""
                     page_header = f"\n===== Page {i+1}{suffix}/{nb_pages} =====\n"
-                    all_pages_text.append(page_header + txt + "\n")
-                    self.logln(f"[Page {i+1}{suffix}] {len(txt)} caractères extraits")
+                    entry = page_header + txt + "\n"
+                    self._q_put("log", f"[Page {i+1}{suffix}] {len(txt)} caractères extraits")
+
+                    if txt_file is not None:
+                        sep = "\n\f\n" if self.keep_pagebreaks_var.get() else "\n\n"
+                        if not txt_first_entry:
+                            txt_file.write(sep)
+                        txt_file.write(entry.strip())
+                        txt_file.flush()
+                        txt_first_entry = False
+
+                    if docx is not None:
+                        docx.add_heading(f"Page {i+1}{suffix}/{nb_pages}", level=2)
+                        docx.add_paragraph(txt)
+                        if self.keep_pagebreaks_var.get():
+                            docx.add_page_break()
 
                     if final_pdf is not None:
                         try:
@@ -391,43 +482,58 @@ class OCRApp(tk.Tk):
                             page_pdf = fitz.open(stream=pdf_bytes, filetype='pdf')
                             final_pdf.insert_pdf(page_pdf)
                         except Exception as e:
-                            self.logln(f"[Page {i+1}{suffix}] PDF interrogeable impossible : {e}")
+                            self._q_put("log", f"[Page {i+1}{suffix}] PDF interrogeable impossible : {e}")
 
-                self.progress["value"] = k; self.set_status(f"Page {k} / {len(pages_idx)} traitée"); self.update_idletasks()
+                    processed_sub_pages += 1
+                    if processed_sub_pages % SAVE_EVERY == 0:
+                        if docx is not None:
+                            try: docx.save(docx_out)
+                            except Exception as e: self._q_put("log", f"Sauvegarde intermédiaire DOCX impossible : {e}")
+                        if final_pdf is not None:
+                            try: final_pdf.save(pdf_out)
+                            except Exception as e: self._q_put("log", f"Sauvegarde intermédiaire PDF impossible : {e}")
 
-            if self.format_txt_var.get():
-                with open(txt_out, "w", encoding="utf-8") as f:
-                    if self.keep_pagebreaks_var.get():
-                        f.write("\n\f\n".join(p.strip() for p in all_pages_text))
-                    else:
-                        f.write("\n\n".join(p.strip() for p in all_pages_text))
-                self.logln(f"TXT enregistré : {txt_out}")
+                if cancelled:
+                    break
 
-            if self.format_docx_var.get() and Document is not None:
-                docx = Document()
-                try:
-                    style = docx.styles["Normal"]; font = style.font; font.name = "Calibri"; font.size = Pt(11)
-                except Exception: pass
-                docx.add_heading(f"OCR de {os.path.basename(pdf_path)}", level=1)
-                docx.add_paragraph(f"Généré le {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                for idx, ptxt in enumerate(all_pages_text, start=1):
-                    lines = ptxt.splitlines()
-                    if lines and lines[0].startswith("===== Page "):
-                        docx.add_heading(lines[0].strip("= ").strip(), level=2)
-                        body = "\n".join(lines[1:]).strip()
-                    else:
-                        body = ptxt.strip()
-                    docx.add_paragraph(body)
-                    if self.keep_pagebreaks_var.get() and idx < len(all_pages_text):
-                        docx.add_page_break()
-                docx.save(docx_out); self.logln(f"DOCX enregistré : {docx_out}")
+                self._q_put("progress_value", k)
+                self._q_put("status", f"Page {k} / {len(pages_idx)} traitée")
+
+            if docx is not None:
+                docx.save(docx_out)
+                self._q_put("log", f"DOCX enregistré : {docx_out}")
 
             if final_pdf is not None:
-                final_pdf.save(pdf_out); self.logln(f"PDF interrogeable enregistré : {pdf_out}")
+                final_pdf.save(pdf_out)
+                self._q_put("log", f"PDF interrogeable enregistré : {pdf_out}")
 
-            self.set_status("Terminé ✅"); self.logln("Terminé."); messagebox.showinfo("OCR", "Traitement terminé.")
+            if txt_file is not None:
+                self._q_put("log", f"TXT enregistré : {txt_out}")
+
+            if cancelled:
+                self._q_put("status", "Annulé (résultats partiels enregistrés)")
+                self._q_put("log", "Traitement interrompu : les résultats partiels ont été enregistrés.")
+                self._q_put("info", ("OCR annulé", "Traitement annulé. Les pages déjà traitées ont été enregistrées."))
+            else:
+                self._q_put("status", "Terminé ✅")
+                self._q_put("log", "Terminé.")
+                self._q_put("info", ("OCR", "Traitement terminé."))
+
         except Exception as e:
-            self.set_status("Erreur ❌"); self.logln(f"ERREUR : {e}"); messagebox.showerror("Erreur OCR", str(e))
+            self._q_put("status", "Erreur ❌")
+            self._q_put("log", f"ERREUR : {e}")
+            # on tente de préserver ce qui a déjà été produit avant l'erreur
+            try:
+                if docx is not None: docx.save(docx_out)
+            except Exception: pass
+            try:
+                if final_pdf is not None: final_pdf.save(pdf_out)
+            except Exception: pass
+            self._q_put("error", ("Erreur OCR", str(e)))
+        finally:
+            if txt_file is not None:
+                try: txt_file.close()
+                except Exception: pass
 
 
 def main():
