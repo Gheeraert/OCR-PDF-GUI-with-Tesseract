@@ -114,3 +114,32 @@ Avant d'attaquer l'étape E (perspective/courbure), il serait utile de **tester 
 - ou si la déformation de perspective/courbure est effectivement le facteur limitant, auquel cas l'effort de l'étape E est justifié.
 
 Cela évite d'investir dans OpenCV et une détection de coins si le gain réel s'avère faible une fois les bugs EXIF et l'ordre du pipeline corrigés.
+
+---
+
+## 5. Test sur 3 photos réelles (post étape D) — la recommandation du §4 était juste
+
+Vous avez fourni 3 photos réelles de double-page (`samples/`, Samsung Galaxy A54 5G, 4080×3060). Le pipeline complet (mode photo : deskew + éclairage + découpe + seuillage adaptatif + Tesseract `fra+eng`) a été exécuté dessus. Deux découvertes majeures, corrigées immédiatement, plus une confirmation du facteur limitant réel.
+
+### 5.1 Bug réel : la balise EXIF de ce téléphone contredit la convention supposée
+Les 3 photos portent une balise EXIF `Orientation = 6`. Le correctif de l'étape C (`open_photo()` appliquant systématiquement `ImageOps.exif_transpose()`) part du principe — vrai sur iPhone — que les pixels ne sont pas pivotés et que seule la métadonnée l'indique. **Sur ce Samsung, c'est l'inverse** : vérifié visuellement, les pixels bruts sont déjà correctement orientés (double-page lisible, à l'endroit) ; appliquer la rotation EXIF les tourne à 90° et les rend illisibles.
+
+**Correctif appliqué** : `open_photo(path, apply_exif=False)` — désactivé par défaut. Une case « Appliquer l'orientation EXIF (iPhone) » a été ajoutée dans l'UI pour les appareils qui en ont réellement besoin, à valider au cas par cas via les boutons Aperçu.
+
+### 5.2 Bug réel : `estimate_skew_angle` divergeait vers `max_angle` sur des photos avec bordure
+Sur les photos réelles (qui incluent le fond derrière le livre — tissu, doigt —, contrairement aux images de test synthétiques propres de l'étape D), l'estimation d'angle **saturait systématiquement à la borne de recherche** (`max_angle=5` → 5.0, `max_angle=10` → 10.0, `max_angle=20` → 20.0 : elle « voulait » toujours tourner plus). Cause : `rotate(..., expand=False, fillcolor=0)` remplit les coins de noir, une zone qui grandit avec l'angle et biaise artificiellement la variance mesurée — un artefact que les tests unitaires de l'étape D, construits sur des images propres sans bordure, ne pouvaient pas révéler.
+
+**Correctif appliqué** : (1) une marge de sécurité exclut désormais les coins de remplissage du calcul de variance ; (2) si le résultat retenu est quand même à la limite de la plage recherchée, la fonction renonce et renvoie 0° plutôt que d'appliquer une rotation non fiable. Un test de régression (`test_estimate_skew_angle_ignores_dark_border_padding_artifact`) reproduit ce cas avec une bordure sombre synthétique.
+
+Après ce correctif, l'estimation devient stable et raisonnable (environ -3.5° à -4.5° selon la photo, sans saturation) — mais **n'améliore pas l'OCR de façon décisive** (voir §5.3).
+
+### 5.3 Confirmation : la déformation dominante est une courbure, pas une rotation
+Même avec le deskew corrigé, le texte OCRisé reste largement illisible (voir `AUDIT.md` git history / capture partagée en conversation). En examinant l'image prétraitée à l'échelle, les lignes de texte sont visiblement **courbes** (arquées, remontant vers la reliure), pas simplement penchées d'un angle constant. C'est la signature d'une **courbure de page près du pli** (livre ouvert non parfaitement aplati), pas d'une rotation globale de l'appareil photo au moment de la prise de vue.
+
+**Conséquence directe** : `deskew_image` (une rotation rigide unique) ne peut structurellement pas corriger ce défaut, quel que soit le réglage. Le §2.1 (perspective/courbure, toujours non traité) est donc confirmé empiriquement comme **le facteur limitant réel** sur ces photos — exactement l'hypothèse que le §4 invitait à vérifier avant d'investir dans l'étape E, et qui s'avère vraie.
+
+### 5.4 Deux pistes pour la suite, à trancher avec vous
+1. **Palliatif immédiat (sans code)** : aplatir davantage le livre (poids, main mieux centrée) et/ou photographier une page à la fois plutôt qu'une double-page ouverte — une page unique bien plaquée se courbe beaucoup moins qu'une double-page. Gratuit à tester, potentiellement suffisant.
+2. **Étape E (avec code)** : une correction de courbure réelle est plus exigeante qu'une simple correction de perspective 4-points — celle-ci ne corrige qu'un effet de caméra en biais (trapèze), pas le gondolement physique de la page. Une correction de courbure demande de détecter plusieurs lignes de base de texte et d'ajuster une déformation géométrique (mesh/spline) le long de ces lignes — nettement plus complexe que ce qui a été fait jusqu'ici, nécessite probablement `opencv-python`, et le résultat est plus difficile à garantir/tester que les étapes précédentes.
+
+Recommandation : tester d'abord la piste 1 (gratuite, immédiate) sur quelques photos avant de décider d'investir dans la piste 2.

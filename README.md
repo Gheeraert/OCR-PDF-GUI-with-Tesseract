@@ -139,7 +139,7 @@ Quand la source est un **dossier de photos**, le **Mode photo** se coche automat
 3. **Découpe des doubles pages** (si activée) : sur l'image déjà redressée/corrigée — la détection de gouttière est ainsi plus fiable.
 4. **Seuillage adaptatif**, par sous-image issue de la découpe : binarise par comparaison à une moyenne locale plutôt qu'un seuil global (Otsu), plus robuste si l'éclairage reste légèrement inégal après l'étape 2.
 
-L'**orientation EXIF** des photos (portrait/paysage stocké en métadonnée par le téléphone plutôt que dans les pixels) est automatiquement appliquée à l'ouverture, aussi bien en mode photo qu'en mode standard.
+**Orientation EXIF** : case « Appliquer l'orientation EXIF (iPhone) », **décochée par défaut**. Certains téléphones (iPhone notamment) stockent l'orientation réelle en métadonnée sans faire pivoter les pixels ; cocher cette case corrige alors l'affichage. **Mais d'autres appareils font l'inverse** (vérifié sur un Samsung Galaxy A54 5G) : les pixels sont déjà correctement orientés et la balise Orientation est obsolète — cocher la case tournerait alors vos photos à tort. Utilisez le bouton **Aperçu** pour vérifier avant de lancer un traitement complet.
 
 **Réglages ajustables** (valeurs par défaut adaptées à la plupart des cas) :
 - **Inclinaison max. corrigée (°)** : plage de recherche du redressement (5° par défaut). Montez-la si vos photos sont plus penchées.
@@ -150,7 +150,9 @@ L'**orientation EXIF** des photos (portrait/paysage stocké en métadonnée par 
 
 **Format des photos** : JPG, PNG, TIFF, BMP, WEBP. Le format **HEIC/HEIF** (par défaut sur iPhone) n'est **pas supporté** par Pillow seul — l'appli le signale dans le journal si des fichiers `.heic`/`.heif` sont détectés mais ignorés. Solution : réglez votre téléphone sur « Le plus compatible » (JPEG) avant de photographier, ou exportez vos photos en JPEG avant de lancer l'OCR.
 
-**Limites connues** (non traitées par ce mode) : la **correction de perspective/courbure** de reliure (page qui se creuse près du pli) n'est pas corrigée — si vos photos sont très déformées, une app de scan mobile en amont (recadrage + correction de perspective) donnera de meilleurs résultats que ce plugin seul.
+**Limite confirmée sur des photos réelles** : le redressement (deskew) corrige une **rotation globale** de la photo, mais pas une **courbure locale** de la page (le texte qui gondole progressivement en s'approchant de la reliure d'un livre ouvert). Testé sur 3 photos réelles de double-page : les lignes de texte y sont visiblement courbes (pas seulement penchées), et aucune rotation globale ne peut les redresser — l'OCR reste alors médiocre même avec le Mode photo activé. Si c'est votre cas :
+- **Palliatif immédiat, sans changement de code** : aplatissez mieux le livre (poids, main bien centrée sur la reliure) et/ou photographiez une page à la fois plutôt qu'une double-page — une page unique bien plaquée est beaucoup moins courbée qu'une double-page ouverte.
+- **Palliatif structurel** : une vraie correction de courbure (dewarping) nécessiterait un algorithme dédié (détection des lignes de base du texte + correction géométrique), plus complexe qu'une simple correction de perspective. Non implémenté à ce stade.
 
 ---
 

@@ -8,6 +8,7 @@ OCR PDF → TXT / DOCX (+ PDF interrogeable), gestion des doubles pages, détect
 """
 
 import io
+import math
 import os
 import sys
 import threading
@@ -70,12 +71,16 @@ def pil_from_fitz_pixmap(pix):
     return Image.open(io.BytesIO(data)).convert("RGB")
 
 
-def open_photo(path):
-    """Ouvre une photo en appliquant l'orientation EXIF (essentiel pour les photos
-    de smartphone : beaucoup d'appareils stockent l'orientation en métadonnée sans
-    faire pivoter les pixels ; Image.open() seul l'ignore silencieusement)."""
+def open_photo(path, apply_exif=False):
+    """Ouvre une photo. Si apply_exif=True, applique la rotation indiquée par la
+    balise EXIF Orientation (utile sur iPhone, qui stocke souvent l'orientation en
+    métadonnée sans faire pivoter les pixels). Défaut à False car certains appareils
+    Android (ex. Samsung Galaxy, vérifié empiriquement) font l'inverse : les pixels
+    sont déjà correctement orientés mais une balise Orientation obsolète subsiste —
+    appliquer la rotation dans ce cas tourne l'image à 90°/180° par erreur."""
     img = Image.open(path)
-    img = ImageOps.exif_transpose(img)
+    if apply_exif:
+        img = ImageOps.exif_transpose(img)
     return img.convert("RGB")
 
 
@@ -202,16 +207,32 @@ def estimate_skew_angle(gray_img, max_angle=5.0, step=0.5):
     arr = np.asarray(small, dtype=np.float32)
     bw = (arr < arr.mean()).astype(np.uint8) * 255
     bw_img = Image.fromarray(bw, mode="L")
+    w, h = bw_img.size
+
+    # Marge de sécurité : rotate(..., expand=False) remplit les coins avec fillcolor=0.
+    # Sans l'exclure, cette zone de remplissage (qui grandit avec l'angle) biaise
+    # artificiellement la variance mesurée et peut faire diverger l'estimation vers
+    # max_angle au lieu du véritable angle (observé sur de vraies photos avec bordure).
+    margin_frac = min(0.3, math.sin(math.radians(abs(max_angle))) + 0.05)
+    mx, my = int(w * margin_frac), int(h * margin_frac)
 
     best_angle, best_score = 0.0, -1.0
     angle = -abs(max_angle)
     while angle <= abs(max_angle) + 1e-9:
         rotated = bw_img.rotate(angle, resample=Image.BICUBIC, expand=False, fillcolor=0)
-        row_sums = np.asarray(rotated, dtype=np.float32).sum(axis=1)
-        score = float(row_sums.var())
+        cropped = np.asarray(rotated, dtype=np.float32)[my:h - my, mx:w - mx]
+        score = float(cropped.sum(axis=1).var())
         if score > best_score:
             best_score, best_angle = score, angle
         angle += step
+
+    # Si l'optimum retenu est à la limite de la plage recherchée, l'algorithme n'a
+    # pas convergé vers un véritable maximum interne (cas typique : image déformée
+    # par une perspective/courbure qu'une simple rotation ne peut pas corriger).
+    # Mieux vaut ne rien redresser que d'appliquer une rotation non fiable qui
+    # dégraderait l'image plutôt que de l'améliorer.
+    if abs(abs(best_angle) - abs(max_angle)) < step / 2:
+        return 0.0
     return best_angle
 
 
@@ -309,6 +330,11 @@ class OCRApp(tk.Tk):
         self.imgdir_entry.pack(side="left", fill="x", expand=True, padx=8)
         self.imgdir_browse_btn = ttk.Button(row1b, text="Parcourir…", command=self._browse_image_dir)
         self.imgdir_browse_btn.pack(side="left")
+        self.apply_exif_var = tk.BooleanVar(value=False)
+        self.exif_checkbox = ttk.Checkbutton(
+            row1b, text="Appliquer l'orientation EXIF (iPhone)", variable=self.apply_exif_var,
+        )
+        self.exif_checkbox.pack(side="left", padx=(12, 0))
 
         # Dossier sortie
         row2 = ttk.Frame(frm); row2.pack(fill="x", **pad)
@@ -489,7 +515,7 @@ class OCRApp(tk.Tk):
             paths = list_images_in_folder(image_dir)
             if not paths:
                 raise ValueError("Aucune image (JPG/PNG/…) trouvée dans ce dossier.")
-            return open_photo(paths[0])
+            return open_photo(paths[0], apply_exif=self.apply_exif_var.get())
         else:
             pdf_path = self.pdf_path_var.get().strip()
             if not pdf_path or not os.path.isfile(pdf_path):
@@ -633,6 +659,7 @@ class OCRApp(tk.Tk):
             langs = self.lang_var.get().strip() or "fra"
             pr_str = self.page_range_var.get().strip()
             tess_cfg = self.tess_config_var.get().strip()
+            apply_exif = bool(self.apply_exif_var.get())
             photo_mode = bool(self.photo_mode_var.get())
             max_skew = float(self.max_skew_var.get())
             illum_blur = int(self.illum_blur_var.get())
@@ -652,7 +679,7 @@ class OCRApp(tk.Tk):
 
             def load_page_image(idx):
                 if images_mode:
-                    return open_photo(image_paths[idx])
+                    return open_photo(image_paths[idx], apply_exif=apply_exif)
                 page = doc.load_page(idx)
                 zoom = dpi / 72.0; mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -670,6 +697,8 @@ class OCRApp(tk.Tk):
             self._q_put("log", f"Pages : {pr_str}")
             self._q_put("log", f"Config Tesseract : {tess_cfg or '(par défaut)'}")
             self._q_put("log", f"Mode photo (éclairage + redressement) : {'oui' if photo_mode else 'non'}")
+            if images_mode:
+                self._q_put("log", f"Orientation EXIF appliquée : {'oui' if apply_exif else 'non'}")
 
             pages_idx = self._parse_page_ranges(pr_str, nb_pages)
             if not pages_idx: raise ValueError("Aucune page à traiter.")

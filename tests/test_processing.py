@@ -53,26 +53,31 @@ def test_list_unsupported_images_in_folder_detects_heic(tmp_path):
 
 # ---------- ouverture de photo / EXIF ----------
 
-def test_open_photo_applies_exif_orientation():
+def _write_jpeg_with_orientation_tag(tmp_path, orientation=6):
     img = Image.new("RGB", (100, 60), "white")
     exif = img.getexif()
-    exif[0x0112] = 6  # Orientation : nécessite une rotation pour s'afficher correctement
+    exif[0x0112] = orientation
     buf = io.BytesIO()
     img.save(buf, format="JPEG", exif=exif.tobytes())
-    buf.seek(0)
+    path = tmp_path / "photo.jpg"
+    path.write_bytes(buf.getvalue())
+    return str(path)
 
-    # Image.open() seul ignore l'EXIF : les dimensions ne seraient pas permutées.
-    assert Image.open(buf).size == (100, 60)
 
-    buf.seek(0)
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
-        f.write(buf.read())
-        path = f.name
-    try:
-        assert open_photo(path).size == (60, 100)
-    finally:
-        os.unlink(path)
+def test_open_photo_default_ignores_exif_orientation(tmp_path):
+    # Défaut à apply_exif=False : certains Android (vérifié sur un Galaxy A54 5G
+    # réel) enregistrent une balise Orientation obsolète alors que les pixels
+    # sont déjà correctement orientés ; appliquer la rotation par défaut
+    # tournerait ces photos à tort.
+    path = _write_jpeg_with_orientation_tag(tmp_path, orientation=6)
+    assert open_photo(path).size == (100, 60)
+
+
+def test_open_photo_applies_exif_orientation_when_requested(tmp_path):
+    # Sur les appareils qui suivent la convention EXIF standard (iPhone
+    # notamment), apply_exif=True doit permuter les dimensions.
+    path = _write_jpeg_with_orientation_tag(tmp_path, orientation=6)
+    assert open_photo(path, apply_exif=True).size == (60, 100)
 
 
 # ---------- seuillage / gouttière ----------
@@ -162,6 +167,22 @@ def test_deskew_recovers_known_rotation_angle(true_angle):
     _, estimated_angle = deskew_image(rotated, max_angle=8.0, step=0.5)
     # deskew_image doit tourner dans le sens opposé pour corriger la rotation appliquée
     assert abs(estimated_angle + true_angle) < 1.0
+
+
+def test_estimate_skew_angle_ignores_dark_border_padding_artifact():
+    # Régression : rotate(..., expand=False, fillcolor=0) remplit les coins avec du
+    # noir, ce qui — combiné à une bordure sombre réaliste (cadre décoratif, fond de
+    # photo) — faisait diverger l'estimation vers max_angle au lieu de détecter que
+    # le texte est déjà droit (reproduit sur de vraies photos smartphone).
+    img = Image.new("L", (800, 600), color=255)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([(0, 0), (799, 599)], outline=0, width=40)
+    for y in range(80, 520, 15):
+        draw.line([(80, y), (720, y)], fill=0, width=3)
+
+    for max_angle in (5.0, 10.0, 15.0, 20.0):
+        angle = estimate_skew_angle(img, max_angle=max_angle, step=0.5)
+        assert angle == 0.0, f"max_angle={max_angle} a divergé vers {angle}"
 
 
 def test_estimate_skew_angle_is_near_zero_for_already_straight_image():
