@@ -226,10 +226,14 @@ def deskew_image(img, max_angle=5.0, step=0.5):
     return rotated, angle
 
 
-def postprocess_text(txt: str) -> str:
+def postprocess_text(txt: str, reflow: bool = True) -> str:
+    """reflow=True recolle les lignes simples en paragraphes (texte suivi) ;
+    reflow=False préserve les sauts de ligne d'origine (notes de bas de page,
+    bibliographie, vers, tableaux — où le retour à la ligne est significatif)."""
     txt = txt.replace("\r\n", "\n").replace("\r", "\n")
     txt = re.sub(r"(\w)[\-­]\n(\w)", r"\1\2", txt)
-    txt = re.sub(r"(?<!\n)\n(?!\n)", " ", txt)
+    if reflow:
+        txt = re.sub(r"(?<!\n)\n(?!\n)", " ", txt)
     txt = re.sub(r"[ \t]{2,}", " ", txt)
     return txt.strip()
 
@@ -265,7 +269,13 @@ class OCRApp(tk.Tk):
         # Prétraitement "photo smartphone"
         self.photo_mode_var = tk.BooleanVar(value=False)
         self.max_skew_var = tk.DoubleVar(value=5.0)
+        self.illum_blur_var = tk.IntVar(value=31)     # rayon du flou pour la correction d'éclairage
+        self.thresh_blur_var = tk.IntVar(value=15)    # rayon du flou pour la moyenne locale du seuillage
+        self.thresh_offset_var = tk.IntVar(value=10)  # marge du seuillage adaptatif
         self._photo_mode_user_set = False  # devient True dès que l'utilisateur touche la case lui-même
+
+        # Reflow du texte
+        self.reflow_var = tk.BooleanVar(value=True)
 
         self._worker = None
         self._cancel_event = threading.Event()
@@ -319,6 +329,7 @@ class OCRApp(tk.Tk):
         ttk.Label(row3, text="Pages (ex. 'all', '1-5', '1-3,6,8-') :").grid(row=1, column=2, sticky="e", padx=8)
         ttk.Entry(row3, textvariable=self.page_range_var, width=28).grid(row=1, column=3, sticky="w")
         ttk.Checkbutton(row3, text="Insérer des sauts de page", variable=self.keep_pagebreaks_var).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=4)
+        ttk.Checkbutton(row3, text="Recoller les lignes en paragraphes", variable=self.reflow_var).grid(row=2, column=2, columnspan=2, sticky="w", padx=8, pady=4)
 
         # Formats
         row4 = ttk.LabelFrame(frm, text="Format de sortie"); row4.pack(fill="x", **pad)
@@ -342,13 +353,20 @@ class OCRApp(tk.Tk):
         ttk.Checkbutton(
             row4c, text="Mode photo (correction d’éclairage + redressement + seuillage adaptatif)",
             variable=self.photo_mode_var, command=self._on_photo_mode_toggled,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=4)
+        ).grid(row=0, column=0, columnspan=5, sticky="w", padx=8, pady=4)
         ttk.Label(row4c, text="Inclinaison max. corrigée (°) :").grid(row=1, column=0, sticky="w", padx=8)
         ttk.Spinbox(row4c, from_=1, to=15, increment=1, textvariable=self.max_skew_var, width=6).grid(row=1, column=1, sticky="w")
+        ttk.Label(row4c, text="Flou éclairage (px) :").grid(row=1, column=2, sticky="e", padx=(12, 0))
+        ttk.Spinbox(row4c, from_=5, to=101, increment=2, textvariable=self.illum_blur_var, width=6).grid(row=1, column=3, sticky="w")
+        ttk.Label(row4c, text="Seuillage — flou (px) :").grid(row=2, column=0, sticky="w", padx=8)
+        ttk.Spinbox(row4c, from_=3, to=51, increment=2, textvariable=self.thresh_blur_var, width=6).grid(row=2, column=1, sticky="w")
+        ttk.Label(row4c, text="Seuillage — marge :").grid(row=2, column=2, sticky="e", padx=(12, 0))
+        ttk.Spinbox(row4c, from_=0, to=60, increment=1, textvariable=self.thresh_offset_var, width=6).grid(row=2, column=3, sticky="w")
+        ttk.Button(row4c, text="Aperçu prétraitement (p.1)", command=self.preview_photo_mode).grid(row=1, column=4, rowspan=2, padx=12)
         ttk.Label(
             row4c,
             text="Recommandé pour des photos prises à main levée (à la place du simple contraste/médiane).",
-        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+        ).grid(row=3, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 4))
 
         # Progression
         row5 = ttk.Frame(frm); row5.pack(fill="x", **pad)
@@ -504,6 +522,51 @@ class OCRApp(tk.Tk):
         except Exception as e:
             messagebox.showerror("Erreur", str(e))
 
+    def preview_photo_mode(self):
+        """Montre le résultat du Mode photo (deskew + éclairage + découpe + seuillage
+        adaptatif) sur la première page/photo, avec les réglages actuels de l'UI —
+        pour ajuster les paramètres avant de lancer un traitement complet."""
+        try:
+            img = self._load_first_page_image()
+            gray = img.convert("L")
+            deskewed, angle = deskew_image(gray, max_angle=float(self.max_skew_var.get()))
+            illum = normalize_illumination(deskewed, blur_radius=int(self.illum_blur_var.get()))
+
+            if self.split_doubles_var.get():
+                parts = split_double_page(illum, mode=self.split_mode_var.get(),
+                                           central_frac=self.central_frac_var.get(),
+                                           smooth_px=int(self.smooth_px_var.get()))
+            else:
+                parts = [illum]
+
+            processed = [
+                adaptive_threshold(p, blur_radius=int(self.thresh_blur_var.get()),
+                                    offset=int(self.thresh_offset_var.get()))
+                for p in parts
+            ]
+
+            if len(processed) > 1:
+                gap = 20
+                total_w = sum(p.width for p in processed) + gap * (len(processed) - 1)
+                max_h = max(p.height for p in processed)
+                combo = Image.new("L", (total_w, max_h), 255)
+                x = 0
+                for p in processed:
+                    combo.paste(p, (x, 0)); x += p.width + gap
+                show_img = combo
+            else:
+                show_img = processed[0]
+
+            max_w = 1200
+            scale = min(1.0, max_w / show_img.width)
+            show = show_img.resize((int(show_img.width * scale), int(show_img.height * scale)))
+            top = tk.Toplevel(self); top.title(f"Aperçu prétraitement photo (redressement {angle:+.1f}°)")
+            tkimg = ImageTk.PhotoImage(show)
+            lbl = ttk.Label(top, image=tkimg); lbl.image = tkimg
+            lbl.pack()
+        except Exception as e:
+            messagebox.showerror("Erreur", str(e))
+
     def start_ocr(self):
         if self._worker and self._worker.is_alive():
             messagebox.showinfo("En cours", "Un traitement est déjà en cours."); return
@@ -572,6 +635,10 @@ class OCRApp(tk.Tk):
             tess_cfg = self.tess_config_var.get().strip()
             photo_mode = bool(self.photo_mode_var.get())
             max_skew = float(self.max_skew_var.get())
+            illum_blur = int(self.illum_blur_var.get())
+            thresh_blur = int(self.thresh_blur_var.get())
+            thresh_offset = int(self.thresh_offset_var.get())
+            reflow = bool(self.reflow_var.get())
 
             if images_mode:
                 image_paths = list_images_in_folder(image_dir)
@@ -644,7 +711,7 @@ class OCRApp(tk.Tk):
                     deskewed, angle = deskew_image(img.convert("L"), max_angle=max_skew)
                     if angle:
                         self._q_put("log", f"[Page {i+1}] Redressement : {angle:+.1f}°")
-                    split_source = normalize_illumination(deskewed)
+                    split_source = normalize_illumination(deskewed, blur_radius=illum_blur)
 
                 images_to_ocr = [split_source]
                 if self.split_doubles_var.get():
@@ -660,7 +727,7 @@ class OCRApp(tk.Tk):
 
                     proc = sub_img.convert("L") if sub_img.mode != "L" else sub_img
                     if photo_mode:
-                        proc = adaptive_threshold(proc)
+                        proc = adaptive_threshold(proc, blur_radius=thresh_blur, offset=thresh_offset)
                     else:
                         proc = ImageOps.autocontrast(proc); proc = proc.filter(ImageFilter.MedianFilter(3))
                     try:
@@ -673,7 +740,7 @@ class OCRApp(tk.Tk):
                             self._q_put("log", f"[Page {i+1}] Échec du repli 'eng' : {e2}. Page laissée vide, poursuite du traitement.")
                             txt = ""
 
-                    txt = postprocess_text(txt)
+                    txt = postprocess_text(txt, reflow=reflow)
                     suffix = suffixes[sub_idx] if len(images_to_ocr) > 1 else ""
                     page_header = f"\n===== Page {i+1}{suffix}/{nb_pages} =====\n"
                     entry = page_header + txt + "\n"

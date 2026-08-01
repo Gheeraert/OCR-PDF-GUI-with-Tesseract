@@ -1,0 +1,2 @@
+-r requirements_ocr.txt
+pytest

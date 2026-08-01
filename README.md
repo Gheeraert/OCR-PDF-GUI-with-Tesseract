@@ -26,7 +26,8 @@ Scripts :
   - **Aperçu** de la coupe sur la première page/photo (ligne rouge) pour ajuster avant OCR.
 - **Réglages** : langues Tesseract (`fra`, `eng`, `fra+eng`…), **DPI**, plage de pages, **config Tesseract** (`--oem`, `--psm`), sauts de page, etc.
 - **Prétraitement** automatique léger (niveaux + médiane) pour améliorer l’OCR sur des scans propres.
-- **Mode photo (smartphone)** optionnel : corrige un éclairage non uniforme (flat-fielding par soustraction d'un flou gaussien large), redresse une inclinaison fine (deskew, recherche d'angle par variance de projection) et applique un **seuillage adaptatif** local — plus robuste qu'un simple contraste global pour des photos prises à main levée.
+- **Mode photo (smartphone)** optionnel : corrige un éclairage non uniforme (flat-fielding par soustraction d'un flou gaussien large), redresse une inclinaison fine (deskew, recherche d'angle par variance de projection) et applique un **seuillage adaptatif** local — plus robuste qu'un simple contraste global pour des photos prises à main levée. Réglages (rayon de flou, marge de seuillage) ajustables, avec **aperçu dédié** avant de lancer un traitement complet.
+- **Reflow de paragraphes** désactivable — utile pour préserver la mise en page de notes de bas de page, bibliographies ou vers.
 - Bouton **“Ouvrir le dossier”** en fin de traitement.
 
 ---
@@ -140,6 +141,13 @@ Quand la source est un **dossier de photos**, le **Mode photo** se coche automat
 
 L'**orientation EXIF** des photos (portrait/paysage stocké en métadonnée par le téléphone plutôt que dans les pixels) est automatiquement appliquée à l'ouverture, aussi bien en mode photo qu'en mode standard.
 
+**Réglages ajustables** (valeurs par défaut adaptées à la plupart des cas) :
+- **Inclinaison max. corrigée (°)** : plage de recherche du redressement (5° par défaut). Montez-la si vos photos sont plus penchées.
+- **Flou éclairage (px)** : rayon du flou utilisé pour estimer le fond lumineux (31 par défaut). Augmentez-le si l'ombre/le gradient couvre une grande partie de la photo ; diminuez-le si le texte est très dense (pour ne pas confondre le texte avec le "fond").
+- **Seuillage — flou (px) / marge** : rayon de la moyenne locale et marge de tolérance du seuillage adaptatif (15 px / 10 par défaut). Une marge plus grande conserve plus de gris (texte fin, papier jauni) ; plus petite, un résultat plus contrasté mais plus dur.
+
+**Aperçu prétraitement (p.1)** : affiche le résultat complet du Mode photo (redressement + éclairage + découpe + seuillage) sur la première page/photo avec les réglages actuels — permet d'ajuster les paramètres ci-dessus avant de lancer un traitement complet sur tout un livre/article.
+
 **Format des photos** : JPG, PNG, TIFF, BMP, WEBP. Le format **HEIC/HEIF** (par défaut sur iPhone) n'est **pas supporté** par Pillow seul — l'appli le signale dans le journal si des fichiers `.heic`/`.heif` sont détectés mais ignorés. Solution : réglez votre téléphone sur « Le plus compatible » (JPEG) avant de photographier, ou exportez vos photos en JPEG avant de lancer l'OCR.
 
 **Limites connues** (non traitées par ce mode) : la **correction de perspective/courbure** de reliure (page qui se creuse près du pli) n'est pas corrigée — si vos photos sont très déformées, une app de scan mobile en amont (recadrage + correction de perspective) donnera de meilleurs résultats que ce plugin seul.
@@ -235,12 +243,26 @@ Dans le champ **“Config Tesseract”**, vous pouvez passer les paramètres cou
 
 ---
 
+## 🧪 Tests
+
+Tests unitaires (pytest) pour les fonctions pures de traitement d'image/texte (découpe de double page, mode photo, post-traitement) :
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+---
+
 ## 📂 Structure (suggestion)
 
 ```
 .
 ├── ocr_pdf_gui.py
 ├── requirements_ocr.txt
+├── requirements-dev.txt
+├── tests/
+│   └── test_processing.py
 └── README.md
 ```
 

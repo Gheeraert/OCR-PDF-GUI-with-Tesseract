@@ -1,0 +1,193 @@
+"""Tests unitaires des fonctions pures de ocr_pdf_gui.py (traitement d'image / texte).
+
+Ne couvre pas l'interface Tkinter elle-même (OCRApp), seulement les fonctions
+de module utilisées par le pipeline OCR : ce sont celles qui bougent le plus
+souvent (réglages de découpe, mode photo) et les plus faciles à casser en
+silence lors d'un futur ajustement.
+"""
+import io
+import os
+import sys
+
+import numpy as np
+import pytest
+from PIL import Image, ImageDraw, ImageFilter
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from ocr_pdf_gui import (
+    adaptive_threshold,
+    deskew_image,
+    estimate_skew_angle,
+    find_gutter_x,
+    list_images_in_folder,
+    list_unsupported_images_in_folder,
+    natural_sort_key,
+    normalize_illumination,
+    open_photo,
+    otsu_thresh,
+    postprocess_text,
+    split_double_page,
+)
+
+
+# ---------- tri naturel / listage de dossier ----------
+
+def test_natural_sort_key_orders_numbers_not_lexicographically():
+    names = ["page10.jpg", "page2.jpg", "page1.jpg"]
+    assert sorted(names, key=natural_sort_key) == ["page1.jpg", "page2.jpg", "page10.jpg"]
+
+
+def test_list_images_in_folder_filters_and_sorts(tmp_path):
+    for name in ["page10.jpg", "page2.PNG", "notes.txt", "page1.jpeg"]:
+        (tmp_path / name).write_bytes(b"")
+    result = [os.path.basename(p) for p in list_images_in_folder(str(tmp_path))]
+    assert result == ["page1.jpeg", "page2.PNG", "page10.jpg"]
+
+
+def test_list_unsupported_images_in_folder_detects_heic(tmp_path):
+    (tmp_path / "IMG_001.HEIC").write_bytes(b"")
+    (tmp_path / "page2.jpg").write_bytes(b"")
+    assert list_unsupported_images_in_folder(str(tmp_path)) == ["IMG_001.HEIC"]
+
+
+# ---------- ouverture de photo / EXIF ----------
+
+def test_open_photo_applies_exif_orientation():
+    img = Image.new("RGB", (100, 60), "white")
+    exif = img.getexif()
+    exif[0x0112] = 6  # Orientation : nécessite une rotation pour s'afficher correctement
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", exif=exif.tobytes())
+    buf.seek(0)
+
+    # Image.open() seul ignore l'EXIF : les dimensions ne seraient pas permutées.
+    assert Image.open(buf).size == (100, 60)
+
+    buf.seek(0)
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as f:
+        f.write(buf.read())
+        path = f.name
+    try:
+        assert open_photo(path).size == (60, 100)
+    finally:
+        os.unlink(path)
+
+
+# ---------- seuillage / gouttière ----------
+
+def test_otsu_thresh_separates_bimodal_distribution():
+    # Un léger bruit gaussien simule la variation continue d'une vraie image
+    # (une distribution parfaitement bimodale à 2 valeurs est un cas dégénéré
+    # qui ne se produit jamais sur une photo ou un scan réel).
+    rng = np.random.default_rng(0)
+    low = np.clip(rng.normal(20, 4, 500), 0, 255).astype(np.uint8)
+    high = np.clip(rng.normal(220, 4, 500), 0, 255).astype(np.uint8)
+    arr = np.concatenate([low, high])
+    t = otsu_thresh(arr)
+    assert 20 < t < 220
+
+
+def _make_double_page(width=1000, height=700, gutter_x=None):
+    """Fabrique une image de double page : deux blocs de texte séparés par une
+    bande claire (la gouttière) à gutter_x (par défaut, le centre). Un léger flou
+    simule l'anti-aliasing/le grain d'une vraie photo (une image binaire parfaite
+    est un cas dégénéré pour le seuillage Otsu, cf. test_otsu_thresh_*)."""
+    if gutter_x is None:
+        gutter_x = width // 2
+    img = Image.new("L", (width, height), color=255)
+    draw = ImageDraw.Draw(img)
+    for y in range(20, height - 20, 8):
+        draw.line([(30, y), (gutter_x - 30, y)], fill=0, width=5)
+        draw.line([(gutter_x + 30, y), (width - 30, y)], fill=0, width=5)
+    return img.filter(ImageFilter.GaussianBlur(radius=1.0))
+
+
+def test_find_gutter_x_locates_gutter_near_expected_position():
+    gutter_x = 420
+    img = _make_double_page(width=1000, gutter_x=gutter_x)
+    found = find_gutter_x(img, central_frac=0.6, smooth_px=15)
+    assert abs(found - gutter_x) < 30
+
+
+def test_split_double_page_half_mode_returns_two_equal_halves():
+    img = _make_double_page(width=1000, height=700)
+    left, right = split_double_page(img, mode="half")
+    assert left.size == (500, 700)
+    assert right.size == (500, 700)
+
+
+def test_split_double_page_single_page_ratio_returns_one_image():
+    # Ratio largeur/hauteur < 1.28 : l'heuristique doit renoncer à découper.
+    img = Image.new("L", (600, 900), color=255)
+    result = split_double_page(img, mode="auto")
+    assert len(result) == 1
+    assert result[0].size == (600, 900)
+
+
+# ---------- mode photo : éclairage, seuillage, deskew ----------
+
+def test_normalize_illumination_reduces_lighting_gradient():
+    w, h = 400, 300
+    gradient = np.tile(np.linspace(80, 220, w), (h, 1)).astype(np.uint8)
+    img = Image.fromarray(gradient, mode="L")
+
+    normalized = normalize_illumination(img, blur_radius=31)
+    arr = np.asarray(normalized, dtype=np.float32)
+
+    col_means_before = gradient.astype(np.float32).mean(axis=0)
+    col_means_after = arr.mean(axis=0)
+    assert col_means_after.std() < col_means_before.std()
+
+
+def test_adaptive_threshold_returns_pure_binary_image():
+    w, h = 300, 200
+    gradient = np.tile(np.linspace(60, 200, w), (h, 1)).astype(np.uint8)
+    img = Image.fromarray(gradient, mode="L")
+
+    binary = adaptive_threshold(img)
+    values = set(np.unique(np.asarray(binary)).tolist())
+    assert values <= {0, 255}
+
+
+@pytest.mark.parametrize("true_angle", [3.0, -4.0])
+def test_deskew_recovers_known_rotation_angle(true_angle):
+    img = Image.new("L", (800, 500), color=255)
+    draw = ImageDraw.Draw(img)
+    for y in range(30, 470, 15):
+        draw.line([(40, y), (760, y)], fill=0, width=3)
+    rotated = img.rotate(true_angle, expand=True, fillcolor=255)
+
+    _, estimated_angle = deskew_image(rotated, max_angle=8.0, step=0.5)
+    # deskew_image doit tourner dans le sens opposé pour corriger la rotation appliquée
+    assert abs(estimated_angle + true_angle) < 1.0
+
+
+def test_estimate_skew_angle_is_near_zero_for_already_straight_image():
+    img = Image.new("L", (800, 500), color=255)
+    draw = ImageDraw.Draw(img)
+    for y in range(30, 470, 15):
+        draw.line([(40, y), (760, y)], fill=0, width=3)
+    angle = estimate_skew_angle(img, max_angle=5.0, step=0.5)
+    assert abs(angle) <= 0.5
+
+
+# ---------- post-traitement texte ----------
+
+def test_postprocess_text_reflow_true_joins_single_linebreaks():
+    raw = "Premier mot\ndeuxième mot\n\nNouveau paragraphe"
+    out = postprocess_text(raw, reflow=True)
+    assert out == "Premier mot deuxième mot\n\nNouveau paragraphe"
+
+
+def test_postprocess_text_reflow_false_preserves_linebreaks():
+    raw = "Premier mot\ndeuxième mot\n\nNouveau paragraphe"
+    out = postprocess_text(raw, reflow=False)
+    assert out == "Premier mot\ndeuxième mot\n\nNouveau paragraphe"
+
+
+def test_postprocess_text_dehyphenates_across_linebreak():
+    raw = "un mot cou-\npé en deux"
+    out = postprocess_text(raw, reflow=True)
+    assert "coupé" in out
