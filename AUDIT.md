@@ -173,3 +173,30 @@ Ces deux cas sont désormais couverts par des tests de régression (`tests/test_
 ### 6.4 État et prochaines pistes possibles (non entreprises, à décider avec vous)
 - Le mécanisme est activé par défaut en Mode photo (case décochable, grisée si `opencv-python-headless` absent), avec journalisation (nombre de lignes, courbure corrigée ou non) et aperçu dédié.
 - Piste d'amélioration si les zones à lignes courtes restent insatisfaisantes : assouplir le filtre de largeur minimale spécifiquement pour les bas de page (zone de notes), ou détecter le changement de taille de police pour adapter le modèle localement — non implémenté, effort et bénéfice à évaluer sur davantage de photos réelles avant d'investir.
+
+---
+
+## 7. Amélioration ciblée : notes de bas de page et citations (lignes courtes/resserrées)
+
+Suite à votre demande explicite de continuer sur ce point précis. Trois pistes explorées, une retenue.
+
+### 7.1 Cause identifiée : fusion verticale, pas seulement un filtre trop strict
+Sur la page 2b (`samples/20260801_165639.jpg`), le bloc de notes en bas de page (règle de séparation + ~10 notes à interligne serré) formait **une seule composante connexe de 293 px de haut** au lieu d'une par ligne : les caractères de notes voisines se touchent après binarisation, sans qu'aucune vallée nette ne sépare les lignes dans la projection horizontale d'encre (vérifié : le profil ne redescend jamais près de zéro sur toute la hauteur du bloc). Le centre de masse par colonne, calculé sur ce bloc fusionné, sautait donc de note en note et produisait un ajustement polynomial incohérent qui dégradait tout le bas de la page.
+
+### 7.2 Piste essayée et abandonnée : découpage par projection horizontale
+Scinder la composante fusionnée en sous-bandes via les vallées de sa projection horizontale d'encre. **Ne fonctionne pas sur les vraies notes** : la densité du texte (petite police, plusieurs notes empilées sur toute la largeur) ne laisse aucune vallée franche à détecter. Abandonné.
+
+### 7.3 Piste essayée et abandonnée : détection de lignes via Tesseract (`image_to_data`)
+Remplacer la détection géométrique par le regroupement de mots de Tesseract (qui sait nativement séparer des lignes à interligne serré). **A dégradé le résultat sur le corps de texte** : Tesseract doit lui-même reconnaître des mots pour regrouper des lignes, et sa reconnaissance se dégrade sur du texte encore courbé — précisément le problème qu'on cherche à corriger (l'œuf et la poule). Testé et confirmé sur la page 1a, auparavant quasi parfaite, redevenue dégradée avec cette approche. Abandonné, code entièrement revenu à l'approche géométrique.
+
+### 7.4 Solution retenue : filtres recalibrés sur données réelles
+Deux paramètres de `_detect_text_line_points` recalibrés à partir de mesures sur les composantes réelles des 3 photos (et non plus des valeurs par défaut arbitraires) :
+- `max_component_height_frac` : 0.15 → **0.09** de la hauteur de page. Exclut désormais le bloc de notes fusionné (293 px = 9,6 % de 3060 px) tout en conservant toutes les lignes de corps de texte légitimes observées (jusqu'à 245 px = 8 % dans nos données).
+- `min_line_width_frac` : 0.15 → **0.08** de la largeur de page. Admet comme ancres fiables des lignes plus courtes (citations indentées, certaines lignes de notes non fusionnées), qui étaient auparavant exclues du modèle de courbure sans raison de fiabilité (juste "trop courtes").
+
+Effet : la composante corrompue est désormais écartée (plus de dégradation active), et plus de lignes courtes légitimes participent au modèle. Un test de régression dédié (`test_dewarp_page_detects_short_tightly_spaced_lines`) vérifie sur une page synthétique note/citation que ces lignes sont bien détectées individuellement.
+
+### 7.5 Résultat validé sur les 3 photos réelles
+- **Net progrès confirmé sur les notes** : sur la page 2b, les notes de bas de page ressortent presque intégralement lisibles et correctes (ex. « F. Douay et J.-P. Sermain, "Présentation", E. Négrel et J-P. Sermain (éd.), Une expérience rhétorique... » — comparé au bloc de notes précédemment illisible).
+- **Net progrès confirmé sur le corps de texte** aussi (effet de bord positif) : les zones de texte courant s'en trouvent également améliorées sur plusieurs pages.
+- **Un problème distinct, non résolu, mis au jour en creusant** : sur la page 3b, l'image après dewarping est *visuellement* quasi parfaite (texte et notes bien droits, à l'œil), mais l'OCR reste dégradé par endroits. Cause identifiée : une règle de séparation des notes, quasi horizontale et pleine largeur, est acceptée comme "ligne" par nos filtres (elle a une hauteur et une dispersion verticale compatibles avec du texte) et étend donc la zone recadrée jusqu'au bord de l'image — laissant la bordure décorative du livre dans le cadre, ce qui perturbe l'ordre de lecture de Tesseract (mots réels mais mélangés dans le désordre). Tenté de distinguer une règle graphique d'une vraie ligne par le taux de colonnes encrées après dilatation : **ne fonctionne pas**, la dilatation horizontale (nécessaire pour regrouper les caractères d'une ligne) comble aussi les espaces entre mots d'une vraie ligne, donnant 100 % de couverture dans les deux cas. Reste ouvert — distinct du sujet notes/citations, plutôt rattaché à la détection de bordure de page déjà identifiée comme limite connue.

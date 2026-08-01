@@ -199,7 +199,7 @@ def adaptive_threshold(gray_img, blur_radius=15, offset=10):
     return Image.fromarray(binary, mode="L")
 
 
-def _detect_text_line_points(bw_ink, min_line_width_frac=0.15, max_component_height_frac=0.15,
+def _detect_text_line_points(bw_ink, min_line_width_frac=0.08, max_component_height_frac=0.09,
                               max_y_range_frac=0.1, sample_stride=4):
     """bw_ink : tableau uint8 2D, 255=encre/texte, 0=fond (déjà binarisé).
     Regroupe les caractères/mots en lignes (dilatation horizontale + composantes
@@ -207,12 +207,31 @@ def _detect_text_line_points(bw_ink, min_line_width_frac=0.15, max_component_hei
     l'encre colonne par colonne : ce sont les points de la ligne de base réelle,
     qui peut être courbe (contrairement à une simple détection d'angle global).
 
+    Une variante basée sur Tesseract (`image_to_data`) a été essayée pour mieux
+    gérer les notes/citations, mais s'est révélée moins bonne dans l'ensemble :
+    Tesseract doit lui-même reconnaître des mots pour regrouper des lignes, et sa
+    détection se dégrade sur du texte encore courbé — exactement le cas qu'on
+    cherche à corriger (problème de l'œuf et la poule). L'approche par densité
+    d'encre ci-dessous ne nécessite aucune reconnaissance de caractères et reste
+    donc fiable même sur une page fortement courbée.
+
     Écarte les composantes trop hautes (bordure décorative, illustration, fond de
-    photo verticalement étendu) : une vraie ligne de texte a une hauteur de
-    composante et une dispersion verticale des points d'échantillonnage bien
-    inférieures à la hauteur de la page — observé concrètement sur une photo réelle
-    où la bordure gauche du livre formait, sans ce filtre, une fausse "ligne"
-    couvrant 81% de la hauteur de l'image et corrompait tout le dewarping."""
+    photo verticalement étendu, ou plusieurs lignes fusionnées faute d'interligne
+    suffisant) : une vraie ligne de texte a une hauteur de composante et une
+    dispersion verticale des points d'échantillonnage bien inférieures à la
+    hauteur de la page — observé concrètement sur une photo réelle où la bordure
+    gauche du livre formait une fausse "ligne" couvrant 81% de la hauteur de
+    l'image, et où un bloc de notes de bas de page à interligne serré fusionnait
+    en une seule composante de 293 px sans qu'aucune vallée nette ne permette de
+    le rescinder par projection. Dans ces deux cas, la composante est simplement
+    écartée plutôt que scindée à tort : mieux vaut ne pas mesurer la courbure
+    d'une zone (elle sera alors extrapolée depuis les lignes voisines) que la
+    mesurer de façon incohérente.
+
+    `min_line_width_frac` est volontairement plus permissif (8% de la largeur de
+    page, contre 15% initialement) pour admettre les lignes plus courtes des
+    citations indentées et de nombreuses lignes de notes de bas de page comme
+    ancres à part entière, plutôt que de les exclure du modèle de courbure."""
     import numpy as np
     h, w = bw_ink.shape
     kernel_w = max(15, w // 40)
@@ -226,7 +245,7 @@ def _detect_text_line_points(bw_ink, min_line_width_frac=0.15, max_component_hei
         if comp_w < w * min_line_width_frac or area < 50:
             continue  # trop court/petit pour être une ligne de texte fiable
         if comp_h > h * max_component_height_frac:
-            continue  # bien trop haut pour une seule ligne : bordure/illustration/fond
+            continue  # trop haut pour une seule ligne : bordure/illustration/fond/fusion
         mask = labels == label
         cols = np.where(mask.any(axis=0))[0]
         xs, ys = [], []
@@ -243,16 +262,16 @@ def _detect_text_line_points(bw_ink, min_line_width_frac=0.15, max_component_hei
     return lines
 
 
-def dewarp_page(img, min_lines=4, degree=2, sample_stride=4, bbox_margin_frac=0.02):
+def dewarp_page(img, min_lines=4, degree=2, bbox_margin_frac=0.02):
     """Corrige une courbure locale du texte (page qui gondole près de la reliure
     d'un livre ouvert) en détectant plusieurs vraies lignes de base de texte et en
     les redressant individuellement — contrairement à deskew_image qui applique une
     seule rotation rigide à toute l'image et ne peut pas corriger une courbure.
 
-    Principe : détecter des lignes de texte (regroupement de caractères par
-    dilatation horizontale), ajuster une courbe polynomiale par ligne, puis
-    construire un champ de déplacement vertical par interpolation entre lignes
-    consécutives pour ramener chaque ligne à l'horizontale (cv2.remap).
+    Principe : détecter des lignes de texte réelles (regroupement de mots par
+    Tesseract), ajuster une courbe polynomiale par ligne, puis construire un champ
+    de déplacement vertical par interpolation entre lignes consécutives pour
+    ramener chaque ligne à l'horizontale (cv2.remap).
 
     Retourne (image_corrigée, a_été_appliqué, bbox). `bbox` (left, top, right,
     bottom) est la boîte englobante des lignes détectées, avec une marge — utile
@@ -272,7 +291,7 @@ def dewarp_page(img, min_lines=4, degree=2, sample_stride=4, bbox_margin_frac=0.
     h, w = gray.shape
     _, bw_ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    lines = _detect_text_line_points(bw_ink, sample_stride=sample_stride)
+    lines = _detect_text_line_points(bw_ink)
     if len(lines) < min_lines:
         return img, False, None
 

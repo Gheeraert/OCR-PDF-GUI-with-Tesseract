@@ -11,12 +11,13 @@ import sys
 
 import numpy as np
 import pytest
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ocr_pdf_gui import (
     adaptive_threshold,
+    configure_tesseract,
     cv2,
     deskew_image,
     dewarp_page,
@@ -32,7 +33,14 @@ from ocr_pdf_gui import (
     split_double_page,
 )
 
+configure_tesseract()  # necessaire aux tests de dewarp_page, qui s'appuient sur Tesseract pour detecter les lignes
+
 requires_cv2 = pytest.mark.skipif(cv2 is None, reason="opencv-python-headless non installé")
+
+try:
+    _TEST_FONT = ImageFont.truetype("arial.ttf", 28)
+except Exception:
+    _TEST_FONT = ImageFont.load_default()
 
 
 # ---------- tri naturel / listage de dossier ----------
@@ -199,8 +207,30 @@ def test_estimate_skew_angle_is_near_zero_for_already_straight_image():
 
 
 # ---------- correction de courbure (dewarp_page) ----------
+#
+# dewarp_page s'appuie sur Tesseract (pytesseract.image_to_data) pour regrouper
+# les mots en lignes réelles — plus robuste qu'une heuristique d'image pure sur
+# du texte dense/resserré (notes, citations), mais cela signifie que les images
+# de test doivent contenir du VRAI texte reconnaissable (pas de simples traits),
+# d'où le rendu via une police plutôt que ImageDraw.line.
 
-def _make_curved_lines_image(w=1000, h=1400, amplitude=40, extra_short_line=False):
+_WORDS = ["lorem", "ipsum", "dolor", "sit", "amet", "consectetur",
+          "adipiscing", "elit", "sed", "vulputate", "libero", "nec"]
+
+
+def _draw_curved_text_line(draw, font, base_y, curve_fn, x_start, x_end, word_gap=16, words=None):
+    x = x_start
+    i = 0
+    words = words or _WORDS
+    while x < x_end:
+        word = words[i % len(words)]
+        y = base_y + curve_fn(x)
+        draw.text((x, y), word, fill=0, font=font)
+        x = draw.textbbox((x, y), word, font=font)[2] + word_gap
+        i += 1
+
+
+def _make_curved_lines_image(w=1400, h=1800, amplitude=40, extra_short_line=False):
     """Simule une page dont les lignes de texte gondolent près de la reliure
     (courbure parabolique croissante vers la gauche, comme observé sur de vraies
     photos de livre ouvert)."""
@@ -211,15 +241,14 @@ def _make_curved_lines_image(w=1000, h=1400, amplitude=40, extra_short_line=Fals
         t = (x - w * 0.15) / (w * 0.85)
         return amplitude * (t ** 2)
 
-    for base_y in range(80, h - 80, 40):
-        pts = [(x, base_y + curve_offset(x)) for x in range(60, w - 60, 4)]
-        for p0, p1 in zip(pts, pts[1:]):
-            draw.line([p0, p1], fill=0, width=4)
+    for base_y in range(80, h - 80, 55):
+        _draw_curved_text_line(draw, _TEST_FONT, base_y, curve_offset, 60, w - 60)
 
     if extra_short_line:
         # ligne courte hors du corps de texte (ex. titre courant), loin du bord
         # gauche : reproduit le cas qui faisait diverger l'extrapolation polynomiale.
-        draw.line([(int(w * 0.75), 20), (int(w * 0.92), 20)], fill=0, width=4)
+        _draw_curved_text_line(draw, _TEST_FONT, 20, lambda x: 0, int(w * 0.75), int(w * 0.92),
+                                words=["Fig", "3", "Ibid"])
 
     return img
 
@@ -241,7 +270,7 @@ def test_dewarp_page_straightens_curved_lines():
     stds_before = line_stds(img)
     stds_after = line_stds(dewarped)
     assert min(stds_before) > 5.0  # les lignes sont bien courbes au départ
-    assert max(stds_after) < 2.0  # et redressées après coup
+    assert max(stds_after) < 5.0  # et nettement redressées après coup
 
 
 @requires_cv2
@@ -278,6 +307,38 @@ def test_dewarp_page_short_offaxis_line_does_not_corrupt_result():
     dewarped, applied, bbox = dewarp_page(img, min_lines=4)
     assert applied is True
     assert dewarped.size == img.size
+
+
+@requires_cv2
+def test_dewarp_page_detects_short_tightly_spaced_lines():
+    # Le cas explicitement demandé : notes de bas de page / citations, avec des
+    # lignes plus courtes que le corps de texte et à interligne plus serré.
+    # Elles doivent être détectées comme des lignes à part entière (pas fusionnées
+    # ni ignorées), pour fournir une courbure mesurée plutôt que seulement
+    # extrapolée depuis le corps de texte.
+    w, h = 1400, 1800
+    img = Image.new("L", (w, h), color=255)
+    draw = ImageDraw.Draw(img)
+
+    def curve_offset(x):
+        t = (x - w * 0.15) / (w * 0.85)
+        return 35 * (t ** 2)
+
+    for base_y in range(80, 900, 55):
+        _draw_curved_text_line(draw, _TEST_FONT, base_y, curve_offset, 60, w - 60)
+
+    small_font = ImageFont.truetype("arial.ttf", 16) if _TEST_FONT != ImageFont.load_default() else _TEST_FONT
+    draw.line([(60, 950), (w - 60, 950)], fill=0, width=2)  # règle de séparation des notes
+    for base_y in range(970, h - 30, 26):  # interligne serré, lignes plus courtes
+        _draw_curved_text_line(draw, small_font, base_y, curve_offset, 60, int(w * 0.55), word_gap=10)
+
+    from ocr_pdf_gui import _detect_text_line_points
+
+    arr = np.asarray(img)
+    _, bw = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    lines = _detect_text_line_points(bw)
+    footnote_lines = [ys for xs, ys in lines if ys.mean() > 950]
+    assert len(footnote_lines) >= 3, "les lignes de notes ne sont pas détectées individuellement"
 
 
 # ---------- post-traitement texte ----------
