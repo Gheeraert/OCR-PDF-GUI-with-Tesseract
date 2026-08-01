@@ -90,11 +90,13 @@ Le champ « Résolution (DPI) » reste visible et modifiable même quand la sour
 
 Tous testés (compilation, tests unitaires ciblés sur `open_photo`/`list_unsupported_images_in_folder`, smoke-test UI sur le grisage DPI et la non-réimposition du mode photo).
 
-### Étape D — réglages & confiance utilisateur (impact moyen, effort modéré)
-6. **Exposer `blur_radius`/`offset` du Mode photo dans l'UI** (§2.5), avec valeurs par défaut actuelles conservées.
-7. **Ajouter un bouton « Aperçu prétraitement »** montrant le résultat du Mode photo (image après deskew + illumination + seuillage) sur la première page/photo, sur le même principe que « Aperçu découpe ».
-8. **Rendre le reflow de paragraphes optionnel** (§2.8, hérité v1) — case à cocher, utile pour notes de bas de page/bibliographie/vers.
-9. **Tests unitaires** (pytest) pour les fonctions pures du module, en priorité les fonctions ajoutées à l'étape B (`estimate_skew_angle` sur image synthétique inclinée d'angle connu, `normalize_illumination` sur gradient connu, `natural_sort_key`) — protège contre les régressions avant de toucher à l'étape E.
+### Étape D — réglages & confiance utilisateur ✅ fait (commit `5c96e9e`)
+6. ✅ **`blur_radius`/`offset` du Mode photo exposés dans l'UI** (§2.5) — spinboxes « Flou éclairage », « Seuillage — flou/marge », valeurs par défaut conservées.
+7. ✅ **Bouton « Aperçu prétraitement (p.1) »** — montre le résultat complet du Mode photo (deskew + éclairage + découpe + seuillage) sur la première page/photo, avec les réglages actuels.
+8. ✅ **Reflow de paragraphes optionnel** (§2.8, hérité v1) — case « Recoller les lignes en paragraphes », `postprocess_text(txt, reflow=...)`.
+9. ✅ **16 tests unitaires pytest** (`tests/test_processing.py`) couvrant tri naturel, listage/filtrage de dossier, EXIF (`open_photo`), Otsu, détection de gouttière, découpe de double page, correction d'éclairage, seuillage adaptatif, deskew (angle connu retrouvé à ±1°), post-traitement du texte (reflow on/off, dé-césure). `requirements-dev.txt` + `.gitignore` ajoutés.
+
+Point méthodologique noté en testant : une image synthétique **parfaitement binaire** (deux valeurs de gris exactes, sans bruit) fait dégénérer `otsu_thresh` vers un seuil à la frontière d'une classe plutôt qu'au milieu — cas qui ne se présente jamais sur une vraie photo/scan (toujours du bruit/anti-aliasing), donc sans impact pratique, mais qui a nécessité d'ajouter un léger flou gaussien aux images de test pour qu'elles soient représentatives.
 
 ### Étape E — le vrai gain qualité restant (effort important, dépendance nouvelle)
 10. **Correction de perspective/courbure** (§2.1, le point le plus structurant depuis l'audit v1) : nécessite `opencv-python` (absent du projet). Deux approches possibles, à trancher avec vous avant de coder :
