@@ -41,6 +41,11 @@ try:
 except Exception:
     Document = None
 
+try:
+    import cv2  # OpenCV, utilisé uniquement pour la correction de courbure (dewarp_page)
+except Exception:
+    cv2 = None
+
 
 # ====== Utilitaires ======
 
@@ -194,6 +199,123 @@ def adaptive_threshold(gray_img, blur_radius=15, offset=10):
     return Image.fromarray(binary, mode="L")
 
 
+def _detect_text_line_points(bw_ink, min_line_width_frac=0.15, max_component_height_frac=0.15,
+                              max_y_range_frac=0.1, sample_stride=4):
+    """bw_ink : tableau uint8 2D, 255=encre/texte, 0=fond (déjà binarisé).
+    Regroupe les caractères/mots en lignes (dilatation horizontale + composantes
+    connexes), puis échantillonne pour chaque ligne le centre de masse vertical de
+    l'encre colonne par colonne : ce sont les points de la ligne de base réelle,
+    qui peut être courbe (contrairement à une simple détection d'angle global).
+
+    Écarte les composantes trop hautes (bordure décorative, illustration, fond de
+    photo verticalement étendu) : une vraie ligne de texte a une hauteur de
+    composante et une dispersion verticale des points d'échantillonnage bien
+    inférieures à la hauteur de la page — observé concrètement sur une photo réelle
+    où la bordure gauche du livre formait, sans ce filtre, une fausse "ligne"
+    couvrant 81% de la hauteur de l'image et corrompait tout le dewarping."""
+    import numpy as np
+    h, w = bw_ink.shape
+    kernel_w = max(15, w // 40)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 3))
+    dilated = cv2.dilate(bw_ink, kernel, iterations=1)
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+
+    lines = []
+    for label in range(1, n_labels):
+        _, _, comp_w, comp_h, area = stats[label]
+        if comp_w < w * min_line_width_frac or area < 50:
+            continue  # trop court/petit pour être une ligne de texte fiable
+        if comp_h > h * max_component_height_frac:
+            continue  # bien trop haut pour une seule ligne : bordure/illustration/fond
+        mask = labels == label
+        cols = np.where(mask.any(axis=0))[0]
+        xs, ys = [], []
+        for xc in cols[::sample_stride]:
+            rows = np.where(mask[:, xc] & (bw_ink[:, xc] > 0))[0]
+            if rows.size:
+                xs.append(xc)
+                ys.append(rows.mean())
+        if len(xs) >= 8:
+            ys_arr = np.asarray(ys, dtype=np.float64)
+            if ys_arr.max() - ys_arr.min() > h * max_y_range_frac:
+                continue  # dispersion verticale incohérente avec une seule ligne
+            lines.append((np.asarray(xs, dtype=np.float64), ys_arr))
+    return lines
+
+
+def dewarp_page(img, min_lines=4, degree=2, sample_stride=4, bbox_margin_frac=0.02):
+    """Corrige une courbure locale du texte (page qui gondole près de la reliure
+    d'un livre ouvert) en détectant plusieurs vraies lignes de base de texte et en
+    les redressant individuellement — contrairement à deskew_image qui applique une
+    seule rotation rigide à toute l'image et ne peut pas corriger une courbure.
+
+    Principe : détecter des lignes de texte (regroupement de caractères par
+    dilatation horizontale), ajuster une courbe polynomiale par ligne, puis
+    construire un champ de déplacement vertical par interpolation entre lignes
+    consécutives pour ramener chaque ligne à l'horizontale (cv2.remap).
+
+    Retourne (image_corrigée, a_été_appliqué, bbox). `bbox` (left, top, right,
+    bottom) est la boîte englobante des lignes détectées, avec une marge — utile
+    pour recadrer hors du texte (bordure décorative, fond de la photo, doigt…) qui
+    sinon pollue l'OCR même une fois la courbure corrigée (vérifié empiriquement :
+    sans ce recadrage, une bordure restée dans le cadre générait beaucoup de bruit
+    OCR malgré des lignes de texte déjà bien redressées).
+
+    Si moins de `min_lines` lignes fiables sont détectées (page peu textuelle,
+    illustration…), retourne (image inchangée, False, None) plutôt que de risquer
+    une déformation incontrôlée."""
+    if cv2 is None:
+        return img, False, None
+    import numpy as np
+
+    gray = np.asarray(img.convert("L"))
+    h, w = gray.shape
+    _, bw_ink = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    lines = _detect_text_line_points(bw_ink, sample_stride=sample_stride)
+    if len(lines) < min_lines:
+        return img, False, None
+
+    mx, my = int(w * bbox_margin_frac), int(h * bbox_margin_frac)
+    bbox = (
+        max(0, int(min(xs.min() for xs, _ in lines)) - mx),
+        max(0, int(min(ys.min() for _, ys in lines)) - my),
+        min(w, int(max(xs.max() for xs, _ in lines)) + mx),
+        min(h, int(max(ys.max() for _, ys in lines)) + my),
+    )
+
+    fitted = []
+    for xs, ys in lines:
+        coeffs = np.polyfit(xs, ys, deg=min(degree, len(xs) - 1))
+        fitted.append((coeffs, float(np.mean(ys)), float(xs.min()), float(xs.max())))
+    fitted.sort(key=lambda t: t[1])
+
+    xs_full = np.arange(w, dtype=np.float64)
+    y_refs = np.asarray([y_ref for _, y_ref, _, _ in fitted])
+    # Évaluer le polynôme d'une ligne hors de son propre domaine (x_min, x_max) est
+    # numériquement instable (extrapolation d'un polynôme de degré 2) — observé sur
+    # un titre courant ("INTRODUCTION", ~15% de la largeur de page) dont la courbe,
+    # extrapolée sur toute la largeur, divergeait et corrompait le haut de la page.
+    # On fixe donc l'évaluation à l'intérieur du domaine observé (extrapolation plate).
+    d_matrix = np.stack([
+        np.poly1d(coeffs)(np.clip(xs_full, x_min, x_max)) - y_ref
+        for coeffs, y_ref, x_min, x_max in fitted
+    ])
+
+    ys_all = np.arange(h)
+    idx = np.clip(np.searchsorted(y_refs, ys_all), 1, len(y_refs) - 1)
+    y0, y1 = y_refs[idx - 1], y_refs[idx]
+    t = np.clip((ys_all - y0) / np.maximum(y1 - y0, 1e-6), 0.0, 1.0)
+    disp = (1 - t)[:, None] * d_matrix[idx - 1] + t[:, None] * d_matrix[idx]
+
+    map_x, map_y = np.meshgrid(xs_full.astype(np.float32), ys_all.astype(np.float32))
+    map_y = (map_y + disp).astype(np.float32)
+
+    arr = np.asarray(img)
+    remapped = cv2.remap(arr, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return Image.fromarray(remapped, mode=img.mode), True, bbox
+
+
 def estimate_skew_angle(gray_img, max_angle=5.0, step=0.5):
     """Cherche l'angle (dans [-max_angle, +max_angle]) qui maximise la variance des
     projections horizontales — plus l'image est droite, plus les lignes de texte
@@ -293,6 +415,7 @@ class OCRApp(tk.Tk):
         self.illum_blur_var = tk.IntVar(value=31)     # rayon du flou pour la correction d'éclairage
         self.thresh_blur_var = tk.IntVar(value=15)    # rayon du flou pour la moyenne locale du seuillage
         self.thresh_offset_var = tk.IntVar(value=10)  # marge du seuillage adaptatif
+        self.dewarp_var = tk.BooleanVar(value=(cv2 is not None))  # correction de courbure (nécessite OpenCV)
         self._photo_mode_user_set = False  # devient True dès que l'utilisateur touche la case lui-même
 
         # Reflow du texte
@@ -389,10 +512,17 @@ class OCRApp(tk.Tk):
         ttk.Label(row4c, text="Seuillage — marge :").grid(row=2, column=2, sticky="e", padx=(12, 0))
         ttk.Spinbox(row4c, from_=0, to=60, increment=1, textvariable=self.thresh_offset_var, width=6).grid(row=2, column=3, sticky="w")
         ttk.Button(row4c, text="Aperçu prétraitement (p.1)", command=self.preview_photo_mode).grid(row=1, column=4, rowspan=2, padx=12)
+        dewarp_text = "Correction de courbure (page qui gondole près de la reliure)"
+        if cv2 is None:
+            dewarp_text += " — indisponible (installez opencv-python-headless)"
+        ttk.Checkbutton(
+            row4c, text=dewarp_text, variable=self.dewarp_var,
+            state=("normal" if cv2 is not None else "disabled"),
+        ).grid(row=3, column=0, columnspan=5, sticky="w", padx=8, pady=4)
         ttk.Label(
             row4c,
             text="Recommandé pour des photos prises à main levée (à la place du simple contraste/médiane).",
-        ).grid(row=3, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 4))
+        ).grid(row=4, column=0, columnspan=5, sticky="w", padx=8, pady=(0, 4))
 
         # Progression
         row5 = ttk.Frame(frm); row5.pack(fill="x", **pad)
@@ -549,9 +679,10 @@ class OCRApp(tk.Tk):
             messagebox.showerror("Erreur", str(e))
 
     def preview_photo_mode(self):
-        """Montre le résultat du Mode photo (deskew + éclairage + découpe + seuillage
-        adaptatif) sur la première page/photo, avec les réglages actuels de l'UI —
-        pour ajuster les paramètres avant de lancer un traitement complet."""
+        """Montre le résultat du Mode photo (deskew + éclairage + découpe + courbure
+        + recadrage + seuillage adaptatif) sur la première page/photo, avec les
+        réglages actuels de l'UI — pour ajuster les paramètres avant de lancer un
+        traitement complet."""
         try:
             img = self._load_first_page_image()
             gray = img.convert("L")
@@ -565,6 +696,17 @@ class OCRApp(tk.Tk):
             else:
                 parts = [illum]
 
+            dewarp_info = []
+            if self.dewarp_var.get() and cv2 is not None:
+                dewarped_parts = []
+                for p in parts:
+                    dewarped, applied, bbox = dewarp_page(p)
+                    if applied and bbox is not None:
+                        dewarped = dewarped.crop(bbox)
+                    dewarped_parts.append(dewarped)
+                    dewarp_info.append(applied)
+                parts = dewarped_parts
+
             processed = [
                 adaptive_threshold(p, blur_radius=int(self.thresh_blur_var.get()),
                                     offset=int(self.thresh_offset_var.get()))
@@ -573,9 +715,9 @@ class OCRApp(tk.Tk):
 
             if len(processed) > 1:
                 gap = 20
+                total_h = max(p.height for p in processed)
                 total_w = sum(p.width for p in processed) + gap * (len(processed) - 1)
-                max_h = max(p.height for p in processed)
-                combo = Image.new("L", (total_w, max_h), 255)
+                combo = Image.new("L", (total_w, total_h), 255)
                 x = 0
                 for p in processed:
                     combo.paste(p, (x, 0)); x += p.width + gap
@@ -586,7 +728,10 @@ class OCRApp(tk.Tk):
             max_w = 1200
             scale = min(1.0, max_w / show_img.width)
             show = show_img.resize((int(show_img.width * scale), int(show_img.height * scale)))
-            top = tk.Toplevel(self); top.title(f"Aperçu prétraitement photo (redressement {angle:+.1f}°)")
+            dewarp_txt = ""
+            if dewarp_info:
+                dewarp_txt = " | courbure : " + ", ".join("corrigée" if a else "non détectée" for a in dewarp_info)
+            top = tk.Toplevel(self); top.title(f"Aperçu prétraitement photo (redressement {angle:+.1f}°{dewarp_txt})")
             tkimg = ImageTk.PhotoImage(show)
             lbl = ttk.Label(top, image=tkimg); lbl.image = tkimg
             lbl.pack()
@@ -665,6 +810,7 @@ class OCRApp(tk.Tk):
             illum_blur = int(self.illum_blur_var.get())
             thresh_blur = int(self.thresh_blur_var.get())
             thresh_offset = int(self.thresh_offset_var.get())
+            dewarp_enabled = bool(self.dewarp_var.get()) and cv2 is not None
             reflow = bool(self.reflow_var.get())
 
             if images_mode:
@@ -697,6 +843,8 @@ class OCRApp(tk.Tk):
             self._q_put("log", f"Pages : {pr_str}")
             self._q_put("log", f"Config Tesseract : {tess_cfg or '(par défaut)'}")
             self._q_put("log", f"Mode photo (éclairage + redressement) : {'oui' if photo_mode else 'non'}")
+            if photo_mode:
+                self._q_put("log", f"Correction de courbure : {'oui' if dewarp_enabled else 'non'}")
             if images_mode:
                 self._q_put("log", f"Orientation EXIF appliquée : {'oui' if apply_exif else 'non'}")
 
@@ -756,6 +904,11 @@ class OCRApp(tk.Tk):
 
                     proc = sub_img.convert("L") if sub_img.mode != "L" else sub_img
                     if photo_mode:
+                        if dewarp_enabled:
+                            proc, dewarp_applied, dewarp_bbox = dewarp_page(proc)
+                            if dewarp_applied and dewarp_bbox is not None:
+                                proc = proc.crop(dewarp_bbox)
+                                self._q_put("log", f"[Page {i+1}] Courbure corrigée et recadrée")
                         proc = adaptive_threshold(proc, blur_radius=thresh_blur, offset=thresh_offset)
                     else:
                         proc = ImageOps.autocontrast(proc); proc = proc.filter(ImageFilter.MedianFilter(3))

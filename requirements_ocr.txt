@@ -3,3 +3,4 @@ pillow
 pytesseract
 python-docx
 numpy
+opencv-python-headless

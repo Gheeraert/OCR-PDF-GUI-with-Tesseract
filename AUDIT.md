@@ -143,3 +143,33 @@ Même avec le deskew corrigé, le texte OCRisé reste largement illisible (voir 
 2. **Étape E (avec code)** : une correction de courbure réelle est plus exigeante qu'une simple correction de perspective 4-points — celle-ci ne corrige qu'un effet de caméra en biais (trapèze), pas le gondolement physique de la page. Une correction de courbure demande de détecter plusieurs lignes de base de texte et d'ajuster une déformation géométrique (mesh/spline) le long de ces lignes — nettement plus complexe que ce qui a été fait jusqu'ici, nécessite probablement `opencv-python`, et le résultat est plus difficile à garantir/tester que les étapes précédentes.
 
 Recommandation : tester d'abord la piste 1 (gratuite, immédiate) sur quelques photos avant de décider d'investir dans la piste 2.
+
+---
+
+## 6. Étape E : correction de courbure (dewarping) — implémentée, validée, résultat réel mais imparfait
+
+Décision prise avec vous : piste 2, avec `opencv-python-headless` comme nouvelle dépendance.
+
+### 6.1 Algorithme (`dewarp_page`, `_detect_text_line_points`)
+1. Binarisation Otsu de la sous-page (après éclairage/découpe).
+2. Regroupement des caractères en lignes par dilatation horizontale + composantes connexes (`cv2.connectedComponentsWithStats`).
+3. Pour chaque ligne retenue, échantillonnage colonne par colonne du centre de masse vertical de l'encre → points de la ligne de base réelle (potentiellement courbe).
+4. Ajustement d'un polynôme degré 2 par ligne, tri par position verticale moyenne.
+5. Construction d'un champ de déplacement vertical par interpolation entre lignes consécutives, puis redressement par `cv2.remap`.
+6. Recadrage sur la boîte englobante des lignes détectées (marge 2%), pour exclure bordures/fond de la photo.
+7. Repli sûr : si moins de 4 lignes fiables sont détectées, l'image est retournée inchangée (`applied=False`) plutôt que de risquer une déformation incontrôlée.
+
+### 6.2 Deux bugs trouvés et corrigés pendant le développement (avant même le test sur photos réelles)
+- **Composante trop haute** : sur la première vraie photo testée, la bordure décorative gauche du livre formait une composante connexe couvrant 81 % de la hauteur de l'image, traitée à tort comme une "ligne" et corrompant tout le champ de déplacement. Corrigé par un filtre sur la hauteur de la composante et la dispersion verticale des points échantillonnés.
+- **Extrapolation polynomiale instable** : un titre courant ("INTRODUCTION", ~15 % de la largeur de page) donnait une courbe ajustée sur un domaine étroit, puis évaluée (extrapolée) sur toute la largeur de la page — divergence classique d'un polynôme de degré 2 hors de son domaine d'ajustement, corrompant le haut de la page. Corrigé en bornant l'évaluation de chaque polynôme à son propre domaine (x_min, x_max) observé.
+
+Ces deux cas sont désormais couverts par des tests de régression (`tests/test_processing.py`).
+
+### 6.3 Résultat sur les 3 photos réelles (`samples/`)
+- **Nette amélioration confirmée** : sur la page 1a, le texte redressé est quasi intégralement lisible et correct (contre un résultat entièrement inexploitable sans le dewarping). Sur la page 2b, le paragraphe d'ouverture ("qui est à la fois celle de son siècle et la sienne propre : cela n'a jamais été tenté. On optera donc ici pour une approche essentiellement rhétorique, qui conjuguera...") ressort quasi parfait, là où le même passage sans dewarping était entièrement illisible.
+- **Résultat inégal cependant** : d'autres portions de certaines pages (2b plus loin dans le texte, 3b) restent fortement dégradées. Hypothèse la plus probable : ces zones contiennent des lignes courtes et resserrées (notes de bas de page, citations), pour lesquelles le modèle interpole la courbure à partir des lignes du corps de texte plutôt que de la mesurer directement sur ces lignes-là (trop courtes pour passer le filtre de largeur minimale) — non confirmé avec certitude, à approfondir si vous voulez pousser plus loin.
+- Le comparatif avec/sans dewarping sur la même sous-page confirme que le dewarping n'est jamais pire, et souvent nettement meilleur, sur les passages testés.
+
+### 6.4 État et prochaines pistes possibles (non entreprises, à décider avec vous)
+- Le mécanisme est activé par défaut en Mode photo (case décochable, grisée si `opencv-python-headless` absent), avec journalisation (nombre de lignes, courbure corrigée ou non) et aperçu dédié.
+- Piste d'amélioration si les zones à lignes courtes restent insatisfaisantes : assouplir le filtre de largeur minimale spécifiquement pour les bas de page (zone de notes), ou détecter le changement de taille de police pour adapter le modèle localement — non implémenté, effort et bénéfice à évaluer sur davantage de photos réelles avant d'investir.

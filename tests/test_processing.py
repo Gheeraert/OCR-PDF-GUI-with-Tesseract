@@ -17,7 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ocr_pdf_gui import (
     adaptive_threshold,
+    cv2,
     deskew_image,
+    dewarp_page,
     estimate_skew_angle,
     find_gutter_x,
     list_images_in_folder,
@@ -29,6 +31,8 @@ from ocr_pdf_gui import (
     postprocess_text,
     split_double_page,
 )
+
+requires_cv2 = pytest.mark.skipif(cv2 is None, reason="opencv-python-headless non installé")
 
 
 # ---------- tri naturel / listage de dossier ----------
@@ -192,6 +196,88 @@ def test_estimate_skew_angle_is_near_zero_for_already_straight_image():
         draw.line([(40, y), (760, y)], fill=0, width=3)
     angle = estimate_skew_angle(img, max_angle=5.0, step=0.5)
     assert abs(angle) <= 0.5
+
+
+# ---------- correction de courbure (dewarp_page) ----------
+
+def _make_curved_lines_image(w=1000, h=1400, amplitude=40, extra_short_line=False):
+    """Simule une page dont les lignes de texte gondolent près de la reliure
+    (courbure parabolique croissante vers la gauche, comme observé sur de vraies
+    photos de livre ouvert)."""
+    img = Image.new("L", (w, h), color=255)
+    draw = ImageDraw.Draw(img)
+
+    def curve_offset(x):
+        t = (x - w * 0.15) / (w * 0.85)
+        return amplitude * (t ** 2)
+
+    for base_y in range(80, h - 80, 40):
+        pts = [(x, base_y + curve_offset(x)) for x in range(60, w - 60, 4)]
+        for p0, p1 in zip(pts, pts[1:]):
+            draw.line([p0, p1], fill=0, width=4)
+
+    if extra_short_line:
+        # ligne courte hors du corps de texte (ex. titre courant), loin du bord
+        # gauche : reproduit le cas qui faisait diverger l'extrapolation polynomiale.
+        draw.line([(int(w * 0.75), 20), (int(w * 0.92), 20)], fill=0, width=4)
+
+    return img
+
+
+@requires_cv2
+def test_dewarp_page_straightens_curved_lines():
+    img = _make_curved_lines_image()
+    dewarped, applied, bbox = dewarp_page(img, min_lines=4)
+    assert applied is True
+    assert bbox is not None
+
+    from ocr_pdf_gui import _detect_text_line_points
+
+    def line_stds(pil_img):
+        arr = np.asarray(pil_img.convert("L"))
+        _, bw = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        return [ys.std() for _, ys in _detect_text_line_points(bw)]
+
+    stds_before = line_stds(img)
+    stds_after = line_stds(dewarped)
+    assert min(stds_before) > 5.0  # les lignes sont bien courbes au départ
+    assert max(stds_after) < 2.0  # et redressées après coup
+
+
+@requires_cv2
+def test_dewarp_page_returns_unchanged_when_too_few_lines():
+    blank = Image.new("L", (400, 300), color=255)
+    result_img, applied, bbox = dewarp_page(blank, min_lines=4)
+    assert applied is False
+    assert bbox is None
+    assert result_img is blank
+
+
+@requires_cv2
+def test_dewarp_page_ignores_tall_border_component():
+    # Régression : sur une vraie photo, la bordure décorative du livre formait une
+    # composante connexe couvrant 81% de la hauteur de l'image et corrompait tout
+    # le champ de déplacement. Une bordure verticale haute ne doit pas empêcher un
+    # dewarping correct du texte à l'intérieur.
+    img = _make_curved_lines_image(amplitude=30)
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([(0, 0), (15, img.height - 1)], fill=0)  # bordure verticale fine et haute
+
+    dewarped, applied, bbox = dewarp_page(img, min_lines=4)
+    assert applied is True
+    # la bordure ne doit pas être incluse dans la zone de texte détectée
+    assert bbox[0] > 20
+
+
+@requires_cv2
+def test_dewarp_page_short_offaxis_line_does_not_corrupt_result():
+    # Régression : une ligne courte hors du corps de texte (ex. titre courant),
+    # extrapolée sur toute la largeur par son polynôme, divergeait et corrompait
+    # le champ de déplacement à des positions x éloignées de son propre domaine.
+    img = _make_curved_lines_image(extra_short_line=True)
+    dewarped, applied, bbox = dewarp_page(img, min_lines=4)
+    assert applied is True
+    assert dewarped.size == img.size
 
 
 # ---------- post-traitement texte ----------
