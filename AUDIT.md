@@ -81,14 +81,14 @@ Le champ « Résolution (DPI) » reste visible et modifiable même quand la sour
 
 ## 3. Plan priorisé pour la suite (Étape C et au-delà)
 
-### Étape C — corrections ciblées, faible risque, fort impact (à faire en premier)
-1. **EXIF orientation** (§2.2) — `ImageOps.exif_transpose()` après chaque `Image.open()` en mode photo. Sans ça, le Mode photo peut échouer silencieusement sur de vraies photos de téléphone.
-2. **Réordonner le pipeline photo avant la découpe** (§2.3) — deskew + normalisation d'éclairage sur la page entière avant `split_double_page`, seuillage adaptatif seulement après découpe.
-3. **Griser le champ DPI en mode photo** (§2.6) — cohérence avec le reste de l'UI (déjà fait pour PDF/dossier).
-4. **Avertir explicitement sur les fichiers HEIC/HEIC ignorés** (§2.4) — message dans le journal si des `.heic`/`.heif` sont détectés dans le dossier mais non traités ; note README.
-5. **Ne pas réimposer `photo_mode_var=True` à chaque bascule** (§2.7) — l'activer une seule fois par défaut (ex. seulement si jamais modifié manuellement).
+### Étape C — corrections ciblées, faible risque, fort impact ✅ fait (commit `16386b6`)
+1. ✅ **EXIF orientation** (§2.2) — `open_photo()` applique `ImageOps.exif_transpose()` après chaque `Image.open()`. Testé (image EXIF Orientation=6 synthétique → dimensions correctement permutées).
+2. ✅ **Réordonner le pipeline photo avant la découpe** (§2.3) — deskew + normalisation d'éclairage sur la page entière avant `split_double_page`, seuillage adaptatif seulement après découpe, par sous-image.
+3. ✅ **Griser le champ DPI en mode photo** (§2.6) — `dpi_label`/`dpi_spinbox` désactivés dans `_on_input_mode_change`.
+4. ✅ **Avertir sur les fichiers HEIC/HEIF ignorés** (§2.4) — `list_unsupported_images_in_folder` + message dans le journal + note README.
+5. ✅ **Ne plus réimposer `photo_mode_var=True` à chaque bascule** (§2.7) — `_photo_mode_user_set` mémorise un choix manuel via le `command` du Checkbutton.
 
-Ces cinq points sont mécaniques, testables unitairement, et ne demandent pas de nouvelle dépendance.
+Tous testés (compilation, tests unitaires ciblés sur `open_photo`/`list_unsupported_images_in_folder`, smoke-test UI sur le grisage DPI et la non-réimposition du mode photo).
 
 ### Étape D — réglages & confiance utilisateur (impact moyen, effort modéré)
 6. **Exposer `blur_radius`/`offset` du Mode photo dans l'UI** (§2.5), avec valeurs par défaut actuelles conservées.
