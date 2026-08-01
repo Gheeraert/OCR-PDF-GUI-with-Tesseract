@@ -131,11 +131,16 @@ Sorties : `NOM_OCR.txt`, `NOM_OCR.docx` et/ou `NOM_OCR.pdf` (`NOM` = nom du PDF,
 
 ## 📸 Mode photo (smartphone)
 
-Quand la source est un **dossier de photos**, le **Mode photo** se coche automatiquement (modifiable). Il remplace le prétraitement standard (contraste global + médiane) par trois étapes pensées pour une photo prise à main levée :
+Quand la source est un **dossier de photos**, le **Mode photo** se coche automatiquement la première fois (vous pouvez le décocher, ce choix est ensuite respecté). Il remplace le prétraitement standard (contraste global + médiane) par, dans l'ordre :
 
-1. **Redressement (deskew)** : recherche l'angle (± *Inclinaison max.*, réglable, 5° par défaut) qui aligne le mieux les lignes de texte, par variance des projections horizontales.
-2. **Correction d'éclairage** : divise l'image par une version très floutée d'elle-même (*flat-fielding*) pour atténuer un gradient de lumière (ombre de la main, fenêtre d'un côté).
-3. **Seuillage adaptatif** : binarise par comparaison à une moyenne locale plutôt qu'un seuil global (Otsu), plus robuste si l'éclairage reste légèrement inégal après l'étape 2.
+1. **Redressement (deskew)** sur la page/photo entière : recherche l'angle (± *Inclinaison max.*, réglable, 5° par défaut) qui aligne le mieux les lignes de texte, par variance des projections horizontales.
+2. **Correction d'éclairage** sur la page entière : divise l'image par une version très floutée d'elle-même (*flat-fielding*) pour atténuer un gradient de lumière (ombre de la main, fenêtre d'un côté).
+3. **Découpe des doubles pages** (si activée) : sur l'image déjà redressée/corrigée — la détection de gouttière est ainsi plus fiable.
+4. **Seuillage adaptatif**, par sous-image issue de la découpe : binarise par comparaison à une moyenne locale plutôt qu'un seuil global (Otsu), plus robuste si l'éclairage reste légèrement inégal après l'étape 2.
+
+L'**orientation EXIF** des photos (portrait/paysage stocké en métadonnée par le téléphone plutôt que dans les pixels) est automatiquement appliquée à l'ouverture, aussi bien en mode photo qu'en mode standard.
+
+**Format des photos** : JPG, PNG, TIFF, BMP, WEBP. Le format **HEIC/HEIF** (par défaut sur iPhone) n'est **pas supporté** par Pillow seul — l'appli le signale dans le journal si des fichiers `.heic`/`.heif` sont détectés mais ignorés. Solution : réglez votre téléphone sur « Le plus compatible » (JPEG) avant de photographier, ou exportez vos photos en JPEG avant de lancer l'OCR.
 
 **Limites connues** (non traitées par ce mode) : la **correction de perspective/courbure** de reliure (page qui se creuse près du pli) n'est pas corrigée — si vos photos sont très déformées, une app de scan mobile en amont (recadrage + correction de perspective) donnera de meilleurs résultats que ce plugin seul.
 

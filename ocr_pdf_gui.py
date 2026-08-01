@@ -70,6 +70,15 @@ def pil_from_fitz_pixmap(pix):
     return Image.open(io.BytesIO(data)).convert("RGB")
 
 
+def open_photo(path):
+    """Ouvre une photo en appliquant l'orientation EXIF (essentiel pour les photos
+    de smartphone : beaucoup d'appareils stockent l'orientation en métadonnée sans
+    faire pivoter les pixels ; Image.open() seul l'ignore silencieusement)."""
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img)
+    return img.convert("RGB")
+
+
 def otsu_thresh(arr):
     import numpy as np
     hist, _ = np.histogram(arr.flatten(), bins=256, range=(0,255))
@@ -140,6 +149,7 @@ def split_double_page(img, mode="auto", central_frac=0.4, smooth_px=25):
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".webp")
+UNSUPPORTED_IMAGE_EXTENSIONS = (".heic", ".heif")  # format par défaut des photos iPhone, non lisible par Pillow seul
 
 
 def natural_sort_key(s):
@@ -150,6 +160,12 @@ def list_images_in_folder(folder):
     names = [n for n in os.listdir(folder) if n.lower().endswith(IMAGE_EXTENSIONS)]
     names.sort(key=natural_sort_key)
     return [os.path.join(folder, n) for n in names]
+
+
+def list_unsupported_images_in_folder(folder):
+    names = [n for n in os.listdir(folder) if n.lower().endswith(UNSUPPORTED_IMAGE_EXTENSIONS)]
+    names.sort(key=natural_sort_key)
+    return names
 
 
 def normalize_illumination(gray_img, blur_radius=31):
@@ -249,6 +265,7 @@ class OCRApp(tk.Tk):
         # Prétraitement "photo smartphone"
         self.photo_mode_var = tk.BooleanVar(value=False)
         self.max_skew_var = tk.DoubleVar(value=5.0)
+        self._photo_mode_user_set = False  # devient True dès que l'utilisateur touche la case lui-même
 
         self._worker = None
         self._cancel_event = threading.Event()
@@ -295,8 +312,10 @@ class OCRApp(tk.Tk):
         ttk.Entry(row3, textvariable=self.lang_var, width=20).grid(row=0, column=1, sticky="w")
         ttk.Label(row3, text="Config Tesseract :").grid(row=0, column=2, sticky="e", padx=8)
         ttk.Entry(row3, textvariable=self.tess_config_var, width=28).grid(row=0, column=3, sticky="w")
-        ttk.Label(row3, text="Résolution (DPI) :").grid(row=1, column=0, sticky="w", padx=8, pady=4)
-        ttk.Spinbox(row3, from_=150, to=600, increment=25, textvariable=self.res_dpi_var, width=7).grid(row=1, column=1, sticky="w")
+        self.dpi_label = ttk.Label(row3, text="Résolution (DPI) :")
+        self.dpi_label.grid(row=1, column=0, sticky="w", padx=8, pady=4)
+        self.dpi_spinbox = ttk.Spinbox(row3, from_=150, to=600, increment=25, textvariable=self.res_dpi_var, width=7)
+        self.dpi_spinbox.grid(row=1, column=1, sticky="w")
         ttk.Label(row3, text="Pages (ex. 'all', '1-5', '1-3,6,8-') :").grid(row=1, column=2, sticky="e", padx=8)
         ttk.Entry(row3, textvariable=self.page_range_var, width=28).grid(row=1, column=3, sticky="w")
         ttk.Checkbutton(row3, text="Insérer des sauts de page", variable=self.keep_pagebreaks_var).grid(row=2, column=0, columnspan=2, sticky="w", padx=8, pady=4)
@@ -322,7 +341,7 @@ class OCRApp(tk.Tk):
         row4c = ttk.LabelFrame(frm, text="Prétraitement photo (smartphone)"); row4c.pack(fill="x", **pad)
         ttk.Checkbutton(
             row4c, text="Mode photo (correction d’éclairage + redressement + seuillage adaptatif)",
-            variable=self.photo_mode_var,
+            variable=self.photo_mode_var, command=self._on_photo_mode_toggled,
         ).grid(row=0, column=0, columnspan=3, sticky="w", padx=8, pady=4)
         ttk.Label(row4c, text="Inclinaison max. corrigée (°) :").grid(row=1, column=0, sticky="w", padx=8)
         ttk.Spinbox(row4c, from_=1, to=15, increment=1, textvariable=self.max_skew_var, width=6).grid(row=1, column=1, sticky="w")
@@ -395,8 +414,14 @@ class OCRApp(tk.Tk):
         self.pdf_browse_btn.configure(state=state_pdf)
         self.imgdir_entry.configure(state=state_img)
         self.imgdir_browse_btn.configure(state=state_img)
-        if images_mode:
+        # Le DPI ne s'applique qu'au rendu d'un PDF ; il n'a aucun effet sur des photos déjà rastérisées.
+        self.dpi_label.configure(state=state_pdf)
+        self.dpi_spinbox.configure(state=state_pdf)
+        if images_mode and not self._photo_mode_user_set:
             self.photo_mode_var.set(True)
+
+    def _on_photo_mode_toggled(self):
+        self._photo_mode_user_set = True
 
     def _browse_pdf(self):
         path = filedialog.askopenfilename(title="Choisir un PDF", filetypes=[("PDF", "*.pdf"), ("Tous les fichiers", "*.*")])
@@ -446,7 +471,7 @@ class OCRApp(tk.Tk):
             paths = list_images_in_folder(image_dir)
             if not paths:
                 raise ValueError("Aucune image (JPG/PNG/…) trouvée dans ce dossier.")
-            return Image.open(paths[0]).convert("RGB")
+            return open_photo(paths[0])
         else:
             pdf_path = self.pdf_path_var.get().strip()
             if not pdf_path or not os.path.isfile(pdf_path):
@@ -486,11 +511,13 @@ class OCRApp(tk.Tk):
         pdf_path = self.pdf_path_var.get().strip()
         image_dir = self.image_dir_var.get().strip()
         out_dir = self.out_dir_var.get().strip()
+        heic_files = []
         if images_mode:
             if not image_dir or not os.path.isdir(image_dir):
                 messagebox.showerror("Erreur", "Veuillez choisir un dossier de photos valide."); return
             if not list_images_in_folder(image_dir):
                 messagebox.showerror("Erreur", "Aucune image (JPG/PNG/…) trouvée dans ce dossier."); return
+            heic_files = list_unsupported_images_in_folder(image_dir)
         elif not pdf_path or not os.path.isfile(pdf_path):
             messagebox.showerror("Erreur", "Veuillez choisir un PDF valide."); return
         if not out_dir or not os.path.isdir(out_dir):
@@ -513,6 +540,12 @@ class OCRApp(tk.Tk):
         self.set_status("Préparation…")
         if images_mode:
             self.logln(f"Dossier de photos : {image_dir}")
+            if heic_files:
+                self.logln(
+                    f"⚠ {len(heic_files)} fichier(s) HEIC/HEIF ignoré(s) (non lisibles par Pillow) : "
+                    + ", ".join(heic_files[:5]) + (", …" if len(heic_files) > 5 else "")
+                )
+                self.logln("  → Réexportez ces photos en JPEG, ou installez 'pillow-heif'.")
         else:
             self.logln(f"PDF : {pdf_path}")
         self.logln(f"Dossier de sortie : {out_dir}"); self.logln(f"Tesseract : {found}")
@@ -552,7 +585,7 @@ class OCRApp(tk.Tk):
 
             def load_page_image(idx):
                 if images_mode:
-                    return Image.open(image_paths[idx]).convert("RGB")
+                    return open_photo(image_paths[idx])
                 page = doc.load_page(idx)
                 zoom = dpi / 72.0; mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
@@ -602,9 +635,20 @@ class OCRApp(tk.Tk):
 
                 img = load_page_image(i)
 
-                images_to_ocr = [img]
+                # En mode photo, le redressement et la correction d'éclairage se font
+                # sur la page entière AVANT la découpe des doubles pages : la détection
+                # de gouttière (find_gutter_x) est sensible à l'inclinaison et à un
+                # éclairage inégal, elle doit donc travailler sur l'image déjà corrigée.
+                split_source = img
+                if photo_mode:
+                    deskewed, angle = deskew_image(img.convert("L"), max_angle=max_skew)
+                    if angle:
+                        self._q_put("log", f"[Page {i+1}] Redressement : {angle:+.1f}°")
+                    split_source = normalize_illumination(deskewed)
+
+                images_to_ocr = [split_source]
                 if self.split_doubles_var.get():
-                    images_to_ocr = split_double_page(img, mode=self.split_mode_var.get(),
+                    images_to_ocr = split_double_page(split_source, mode=self.split_mode_var.get(),
                                                       central_frac=self.central_frac_var.get(),
                                                       smooth_px=int(self.smooth_px_var.get()))
 
@@ -614,12 +658,8 @@ class OCRApp(tk.Tk):
                         self._q_put("log", "Traitement annulé par l'utilisateur.")
                         break
 
-                    proc = sub_img.convert("L")
+                    proc = sub_img.convert("L") if sub_img.mode != "L" else sub_img
                     if photo_mode:
-                        deskewed, angle = deskew_image(proc, max_angle=max_skew)
-                        if angle:
-                            self._q_put("log", f"[Page {i+1}] Redressement : {angle:+.1f}°")
-                        proc = normalize_illumination(deskewed)
                         proc = adaptive_threshold(proc)
                     else:
                         proc = ImageOps.autocontrast(proc); proc = proc.filter(ImageFilter.MedianFilter(3))
