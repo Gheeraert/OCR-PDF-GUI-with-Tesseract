@@ -2,3 +2,4 @@ pymupdf
 pillow
 pytesseract
 python-docx
+numpy

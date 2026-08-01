@@ -51,6 +51,7 @@ pymupdf
 pillow
 pytesseract
 python-docx
+numpy
 ```
 
 2) Installer **Tesseract OCR** (voir ci-dessous selon votre OS).
