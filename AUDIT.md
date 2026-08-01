@@ -1,127 +1,114 @@
-# Audit du dépôt OCR-PDF-GUI-with-Tesseract
+# Audit du dépôt OCR-PDF-GUI-with-Tesseract — v2 (post étapes A & B)
 
 Date : 2026-08-01
-Périmètre : `ocr_pdf_gui.py` (439 lignes, application unique), `README.md`, `requirements_ocr.txt`.
-Contexte d'usage communiqué : numériser, avec un smartphone, des photos de pages et de doubles-pages d'articles/ouvrages (préparation à l'Agrégation), puis en tirer un OCR exploitable (TXT/DOCX/PDF interrogeable).
+Périmètre : `ocr_pdf_gui.py` (722 lignes), `README.md`, `requirements_ocr.txt`, tel qu'après les commits :
+- `00bf154` Étape A : fiabilise le traitement OCR long (thread-safety UI, sauvegarde incrémentale, bouton Annuler, fallback langue protégé, numpy ajouté)
+- `8d63e00` Étape B : import direct de photos (dossier JPG/PNG…) + « Mode photo » (correction d'éclairage, deskew, seuillage adaptatif)
+
+Contexte d'usage : OCRiser des **photographies prises au smartphone** d'articles et d'ouvrages universitaires (préparation à l'Agrégation) — pages simples ou doubles-pages de livre ouvert.
+
+Cet audit revérifie le code réel ligne par ligne (pas un résumé de mémoire) : chaque point ci-dessous cite le fichier/la ligne concernée et, pour les points nouveaux, a été testé empiriquement.
 
 ---
 
-## 1. Résumé
+## 1. Ce que les étapes A et B ont réellement corrigé (vérifié)
 
-Le code est un script Tkinter monofichier, propre et lisible pour ce qu'il fait : il rend des pages PDF en image via PyMuPDF, détecte optionnellement une gouttière de reliure pour scinder les doubles pages, prétraite légèrement l'image (niveaux de gris, autocontraste, filtre médian) puis lance Tesseract. C'est un outil solide **pour des PDF déjà issus d'un scanner à plat**.
+| # | Problème (audit v1) | Statut | Où |
+|---|---|---|---|
+| 3.1 | `numpy` manquant de `requirements_ocr.txt` | ✅ corrigé | `requirements_ocr.txt` |
+| 3.2 | Écritures Tkinter depuis le thread worker | ✅ corrigé | `_q_put`/`_poll_queue`, `ocr_pdf_gui.py:358-381` — tout passe par une `queue.Queue` consommée via `self.after` |
+| 3.3 | Pas de sauvegarde incrémentale (perte totale si crash tardif) | ✅ corrigé | TXT flush à chaque page (`:642-648`), DOCX/PDF sauvegardés tous les `SAVE_EVERY=10` (`:664-671`) et aussi en cas d'exception (`:703-708`) |
+| 3.4 | Pas de bouton d'annulation | ✅ corrigé | `cancel_ocr`, `self._cancel_event`, vérifié à chaque page et sous-page (`:598`, `:612`) |
+| — | Fallback langue non protégé | ✅ corrigé | `try/except` imbriqué autour du fallback `eng` (`:626-634`) |
+| 2.1 | Aucun chemin image → OCR direct (PDF obligatoire) | ✅ corrigé | Sélecteur de source PDF / dossier de photos, `list_images_in_folder` (`:149-152`), `load_page_image` (`:553-559`) |
+| 2.3 | Aucune correction d'éclairage non uniforme | ✅ corrigé (optionnel, « Mode photo ») | `normalize_illumination` (`:155-163`) |
+| 2.4 | Aucun redressement (deskew) fin | ✅ corrigé (optionnel, « Mode photo ») | `estimate_skew_angle` / `deskew_image` (`:176-210`) |
 
-Le problème principal n'est pas dans la qualité du code, mais dans l'**adéquation stratégique** : l'outil est conçu pour des scans plats et propres, alors que l'usage visé — photos prises à main levée avec un smartphone — produit des images avec des défauts (perspective, courbure de reliure, éclairage non uniforme, rotation) qu'aucune étape du pipeline ne corrige. Sans une app de scan côté téléphone qui fait déjà ce travail en amont, la qualité d'OCR sera décevante quel que soit le réglage Tesseract choisi côté PC.
-
-Un second point structurel : l'outil n'accepte que des **PDF** en entrée. Un usage "photo de smartphone" produit typiquement des JPEG page par page ; il n'y a aucun chemin direct image → OCR, il faut d'abord assembler un PDF par un autre moyen.
-
-Enfin, il y a un bug de dépendance réel (`numpy` manquant dans `requirements_ocr.txt`) et un problème de thread-safety Tkinter qui peut provoquer des plantages/gels aléatoires en cours de traitement long — précisément le scénario "scanner un chapitre entier".
+Ces huit points sont vérifiés dans le code actuel, testés (compilation, tests unitaires ad hoc sur les fonctions pures, smoke-test UI) et fonctionnels.
 
 ---
 
-## 2. Adéquation stratégique à l'usage visé (photos smartphone)
+## 2. Ce qui reste non traité ou insuffisamment traité (vérifié)
 
-### 2.1 Aucun chemin image → OCR direct (bloquant en pratique)
-`start_ocr()`/`_do_ocr()` n'acceptent qu'un fichier `.pdf` (`fitz.open(pdf_path)`, ligne 353). Si vous photographiez des pages avec l'appareil photo natif, vous obtenez des `.jpg`, pas un PDF. Il faut donc :
-- soit utiliser une app de scan tierce (Apple Notes/Scan, Google Drive scan, Adobe Scan, CamScanner…) qui exporte en PDF — auquel cas cette app tierce fait déjà l'essentiel du travail de correction de perspective et d'éclairage, ce qui change beaucoup l'évaluation du reste de l'audit ;
-- soit assembler manuellement les JPEG en PDF (aucun outil fourni dans ce dépôt pour cela).
+### 2.1 Aucune correction de perspective / courbure de reliure — **toujours absent**
+Aucune trace de `cv2`, `getPerspectiveTransform`, `warpPerspective` ou logique équivalente dans le fichier (recherche vide). C'était le point le plus structurant de l'audit v1 (§2.2) et **il n'a pas été traité** par les étapes A/B — le deskew ne corrige qu'une rotation globale de quelques degrés, pas une déformation trapézoïdale ni la courbure de page près de la reliure. C'est toujours, de loin, le facteur qui limitera le plus la qualité d'OCR sur une vraie photo de livre ouvert à main levée.
 
-**Recommandation** : soit documenter explicitement dans le README quelle app de scan utiliser en amont (et pourquoi), soit ajouter un import direct de JPG/PNG (glob de dossier → tri naturel des fichiers → traitement comme des "pages"), ce qui est un ajout raisonnable dans `_do_ocr` (remplacer la boucle `fitz` par une liste de chemins images quand l'entrée n'est pas un PDF).
-
-### 2.2 Aucune correction de perspective / déformation de reliure
-Une photo de livre ouvert à main levée n'est presque jamais un rectangle parfaitement plan : la page proche de la reliure se courbe, et l'angle de prise de vue introduit une perspective (trapèze). `find_gutter_x()` (ligne 95) suppose une image déjà "plate" : elle cherche une simple vallée verticale de faible densité d'encre par projection de colonnes. Sur une photo courbée :
-- le texte proche de la reliure est distordu/flou, donc l'OCR y sera mauvais indépendamment de la coupe ;
-- la "gouttière" elle-même peut ne pas être une ligne verticale nette, ce qui dégradera la détection automatique.
-
-Il n'y a aucune étape de type "détection des 4 coins de page + correction de perspective" (`cv2.getPerspectiveTransform` / `warpPerspective` seraient l'approche standard avec OpenCV, absent des dépendances).
-
-### 2.3 Aucune correction d'éclairage non uniforme
-Une photo au smartphone a très souvent un gradient d'éclairage (ombre portée de la main/du téléphone, lumière de fenêtre d'un côté). Le prétraitement actuel (`ImageOps.autocontrast` + `MedianFilter(3)`, ligne 375) est un simple étirement global de contraste : il ne corrige pas un gradient local. Un scan plat classique n'a généralement pas ce problème (éclairage du scanner uniforme), donc cette lacune est spécifique à l'usage smartphone.
-
-**Recommandation concrète** : ajouter une correction d'illumination par division par une version très floutée de l'image ("flat-fielding" / normalisation d'arrière-plan), par exemple :
+### 2.2 EXIF non pris en compte à l'ouverture des photos — **bug réel, nouveau (introduit par l'étape B)**
+`Image.open(image_paths[idx]).convert("RGB")` (`:555`, et `_load_first_page_image` `:449`) n'applique **pas** l'orientation EXIF. Vérifié empiriquement :
 ```python
-bg = gray.filter(ImageFilter.GaussianBlur(radius=large))
-normalized = divide(gray, bg) * 255  # via numpy
+img = Image.new("RGB", (100, 60), "white")
+exif = img.getexif(); exif[0x0112] = 6  # Orientation
+... img.save(buf, format="JPEG", exif=exif.tobytes())
+Image.open(buf).size            # -> (100, 60)  — EXIF ignoré
+ImageOps.exif_transpose(...).size  # -> (60, 100) — correction appliquée
 ```
-puis seuillage adaptatif (Sauvola/Niblack ou `cv2.adaptiveThreshold`) plutôt qu'Otsu global, qui est sensible aux gradients.
+De nombreux téléphones (notamment iPhone) enregistrent l'orientation réelle **dans les métadonnées EXIF** plutôt que de faire pivoter les pixels. Sans `ImageOps.exif_transpose()`, une photo prise en portrait peut être traitée à l'envers ou sur le côté : OCR catastrophique, et détection de gouttière (`find_gutter_x`) faussée puisqu'elle suppose une page verticale. C'est un **bug bloquant en pratique**, silencieux (pas d'erreur, juste un résultat mauvais), et probablement la cause la plus probable d'une déception si l'utilisateur teste le mode photo sur de vraies photos de smartphone.
 
-### 2.4 Aucun redressement (deskew) de petite amplitude
-Une photo à main levée est rarement parfaitement droite (quelques degrés d'inclinaison typiques). Tesseract avec `--psm 1` détecte l'orientation (rotations de 90°/180°/270° via OSD) mais **ne corrige pas une inclinaison fine** de quelques degrés, qui dégrade sensiblement la reconnaissance ligne par ligne. Aucune étape de deskew (recherche de l'angle qui maximise la variance des projections horizontales, ou transformée de Hough) n'est présente.
+**Correctif** : appliquer `img = ImageOps.exif_transpose(img)` juste après chaque `Image.open(...)` dans `load_page_image` et `_load_first_page_image`.
 
-### 2.5 Le réglage DPI est trompeur pour une entrée "photo"
-Le champ "Résolution (DPI)" (ligne 200) et le rendu `zoom = dpi/72.0` (ligne 364) n'ont de sens que pour un PDF vectoriel ou un PDF-scan dont on connaît la résolution d'origine. Si le PDF contient en réalité une photo JPEG déjà rastérisée, augmenter le DPI ne fait qu'agrandir l'image sans apporter d'information (upscaling), ce qui peut donner une fausse impression de contrôle qualité. Cela mérite au moins une note dans le README pour ne pas faire perdre du temps à l'utilisateur à monter le DPI sans effet réel.
+### 2.3 Le pipeline « Mode photo » ne corrige pas l'image *avant* la découpe des doubles pages — **bug de conception, nouveau (introduit par l'étape B)**
+Dans `_do_ocr` :
+- `:603` `img = load_page_image(i)` — image brute (pas de deskew, pas de correction d'éclairage).
+- `:605-609` `split_double_page(img, ...)` — la détection de gouttière (`find_gutter_x`) tourne sur cette image **brute**, avec son propre mini-pipeline interne (Otsu + autocontrast + médiane, `:102-107`), indépendant du « Mode photo ».
+- **Seulement ensuite**, `:617-623`, pour chaque **sous-image déjà découpée**, le deskew + normalisation d'éclairage + seuillage adaptatif sont appliqués.
 
-### 2.6 Le reflow de texte peut nuire aux usages académiques
-`postprocess_text()` (ligne 141) transforme systématiquement tout saut de ligne simple en espace (`re.sub(r"(?<!\n)\n(?!\n)", " ", txt)`) pour recoller les lignes en paragraphes. C'est excellent pour du texte courant, mais problématique pour :
-- des notes de bas de page (numérotation, structure en colonnes séparée du corps de texte) ;
-- des citations en vers, des références bibliographiques, des tableaux — fréquents dans des articles/ouvrages académiques.
+Conséquence : sur une photo penchée et/ou mal éclairée, la détection de la gouttière (l'étape la plus sensible à ces deux défauts, cf. audit v1 §2.2) ne bénéficie d'aucune des améliorations du Mode photo. Le mode photo corrige la lisibilité du texte après coup, mais pas la fiabilité de la découpe elle-même.
 
-Il n'y a pas d'option pour désactiver ce reflow. Idéalement, ce comportement devrait être un choix dans l'UI ("recoller les lignes en paragraphes : oui/non"), avec `oui` par défaut pour du texte suivi et `non` pour un article à notes/bibliographie.
+**Correctif recommandé** : réordonner le pipeline pour la page entière **avant** la découpe : `deskew(page entière)` → `normalize_illumination(page entière)` → `split_double_page(image corrigée)` → `adaptive_threshold` par sous-image → OCR. Le deskew sur la double-page entière est aussi plus robuste (plus de texte = estimation d'angle plus stable) que sur chaque moitié séparément.
 
----
+### 2.4 HEIC/HEIF non supporté — **gap probable pour l'usage réel**
+`IMAGE_EXTENSIONS` (`:142`) ne liste pas `.heic`/`.heif`, et Pillow ne sait pas nativement décoder ce format (nécessite le paquet optionnel `pillow-heif`). Or c'est le **format par défaut des photos iPhone** depuis iOS 11. Si l'utilisateur ne change pas ses réglages d'appareil photo (Réglages → Appareil photo → Formats → « Le plus compatible »), le dossier de photos sera vide aux yeux de `list_images_in_folder`, sans message d'erreur explicite au moment du choix du dossier (l'erreur ne sera vue qu'au clic sur « Démarrer » : « Aucune image trouvée »).
 
-## 3. Bugs et risques techniques (indépendants de l'usage photo)
+**Correctif rapide** : documenter clairement dans le README (« exportez/prenez vos photos en JPEG, pas HEIC ») et/ou détecter les `.heic`/`.heif` présents pour avertir explicitement l'utilisateur plutôt que de les ignorer silencieusement. Ajout optionnel plus tard : dépendance `pillow-heif` + `pillow_heif.register_heif_opener()`.
 
-### 3.1 `numpy` manquant de `requirements_ocr.txt` — bug réel
-`otsu_thresh()` (ligne 73) et `find_gutter_x()` (ligne 100) font `import numpy as np`, mais `requirements_ocr.txt` ne liste que `pymupdf`, `pillow`, `pytesseract`, `python-docx`. Sur une installation propre suivant strictement le README (`pip install -r requirements_ocr.txt`), l'app plante dès qu'on active "Couper les doubles pages" (activé par défaut, `split_doubles_var = True` ligne 170) ou qu'on clique "Aperçu découpe". `numpy` n'est garanti par aucune des quatre dépendances déclarées.
+### 2.5 Réglages du Mode photo non ajustables et non prévisualisables
+`normalize_illumination` (rayon de flou = 31) et `adaptive_threshold` (rayon = 15, offset = 10) ont des paramètres **codés en dur** (`:155`, `:166`), contrairement à la découpe de double page qui expose `central_frac`/`smooth_px` réglables avec aperçu. Une photo avec un gradient de lumière plus fort ou plus doux, ou un papier plus jauni, demandera probablement un réglage différent. Il n'existe aucun moyen de voir le résultat du Mode photo avant de lancer un traitement complet (le bouton « Aperçu découpe » ne montre que la ligne de coupe sur l'image brute, jamais le résultat du prétraitement photo).
 
-**Correctif** : ajouter `numpy` à `requirements_ocr.txt`.
+### 2.6 Résolution DPI trompeuse en mode photo (variante du point v1 §2.5)
+Le champ « Résolution (DPI) » reste visible et modifiable même quand la source est un dossier de photos, alors qu'il n'a strictement aucun effet dans ce mode (`load_page_image` en mode images ignore `dpi`). Contrairement au champ PDF/dossier de photos (désactivé dynamiquement via `_on_input_mode_change`), le DPI n'est pas grisé — risque de faire perdre du temps à l'utilisateur pour rien.
 
-### 3.2 Écritures Tkinter depuis un thread worker — thread-safety
-`_do_ocr()` tourne dans un `threading.Thread` (ligne 334) et appelle directement `self.logln(...)`, `self.progress["value"] = k`, `self.set_status(...)`, `self.update_idletasks()` (lignes 386-396) depuis ce thread. Tkinter n'est pas thread-safe : les mises à jour de widgets doivent passer par le thread principal (typiquement via une queue consommée par `self.after(...)`). En pratique, ça "marche souvent" mais peut provoquer des gels ou plantages aléatoires, plus probables sur un traitement long (nombreuses pages) — exactement le cas d'usage visé (scanner un chapitre entier).
+### 2.7 « Mode photo » réimposé à chaque bascule de source
+`_on_input_mode_change` (`:398-399`) force `photo_mode_var` à `True` **à chaque clic** sur le radiobouton « Dossier de photos », même si l'utilisateur l'avait explicitement décoché entre-temps (cas d'usage plausible : photos déjà pré-redressées par une autre app). Mineur, mais à corriger (ne l'activer par défaut qu'une fois, à la première sélection).
 
-**Recommandation** : faire communiquer le worker via une `queue.Queue`, et consommer cette queue côté thread principal avec `self.after(50, poll_queue)`.
-
-### 3.3 Aucune sauvegarde incrémentale → perte totale en cas d'échec tardif
-Le texte de toutes les pages est accumulé en mémoire (`all_pages_text`, ligne 358) et les fichiers de sortie ne sont écrits qu'**après** la boucle complète (lignes 398-426). Si une exception non rattrapée survient à la page 150 sur 200 (page corrompue, erreur Tesseract sur une page particulière suivie d'un échec du fallback "eng" lui-même — le `except` interne ligne 378 ne protège que le premier essai, pas le fallback ligne 380), tout le travail déjà fait est perdu : rien n'est écrit sur disque.
-
-**Recommandation** : écrire le TXT de façon incrémentale (au fur et à mesure, ou au moins par blocs de N pages), et/ou envelopper aussi l'appel de fallback dans un `try/except` qui log l'erreur et passe à la page suivante plutôt que d'interrompre tout le traitement.
-
-### 3.4 Pas de bouton d'annulation
-Pour un traitement long (livre entier), il n'existe aucun moyen d'interrompre proprement le worker une fois lancé (ligne 334, `daemon=True` seulement — le thread continue jusqu'à la fin ou jusqu'à fermeture de l'appli). Un simple flag `threading.Event` vérifié à chaque itération de la boucle (ligne 362) réglerait ça facilement.
-
-### 3.5 Regex de dé-césure incomplète
-`postprocess_text()` (ligne 143) : `re.sub(r"(\w)[\-­]\n(\w)", r"\1\2", txt)` ne traite que le trait d'union ASCII (`-`) et le trait d'union conditionnel (`\xAD`). Les OCR de textes imprimés en français produisent parfois un tiret typographique différent selon la police/l'OCR (rare mais possible). Impact mineur, à surveiller si vous constatez des mots coupés non recollés.
-
-### 3.6 Robustesse des entrées utilisateur (mineure)
-Les `Spinbox` pour DPI, fenêtre centrale et lissage (lignes 201, 218, 220) ne valident pas leur contenu : un utilisateur peut taper une valeur non numérique ou vide, ce qui lèvera une exception `ValueError`/`TclError` non gérée avec un message peu clair au moment du `int(...)`/`float(...)` (lignes 340, 372). Impact faible (erreur visible, pas de corruption de données) mais expérience utilisateur dégradée.
-
-### 3.7 Absence de tests
-Aucun test automatisé n'existe pour `otsu_thresh`, `find_gutter_x`, `split_double_page` ou `postprocess_text` — ce sont pourtant des fonctions pures, facilement testables unitairement (entrée image/texte connue → sortie attendue), et ce sont précisément les fonctions les plus sensibles à un changement de type d'entrée (photo vs scan). Des tests couvriraient utilement une régression si vous ajustez l'algo de gouttière pour mieux gérer les photos.
+### 2.8 Toujours non traités depuis l'audit v1 (revérifiés, inchangés)
+- **§2.6 / §5.11** — Reflow de paragraphes (`postprocess_text`, `:216`) toujours non désactivable ; problématique pour notes de bas de page/bibliographie.
+- **§3.5** — Regex de dé-césure (`:215`) toujours limitée à `-` et `\xAD`.
+- **§3.6** — Spinboxes (DPI, fenêtre centrale, lissage, et maintenant inclinaison max `:328`) toujours sans validation ; en pratique sans gravité car les erreurs de conversion (`int()`/`float()`) sont maintenant absorbées par le `try/except` global de `_do_ocr` et remontées proprement via `messagebox.showerror`, mais un message plus spécifique serait préférable.
+- **§3.7** — Toujours **aucun test automatisé**, alors que le nombre de fonctions pures testables a augmenté (7 désormais : `otsu_thresh`, `find_gutter_x`, `split_double_page`, `postprocess_text`, `normalize_illumination`, `adaptive_threshold`, `estimate_skew_angle`/`deskew_image`, `natural_sort_key`). Le risque de régression silencieuse augmente avec la taille du pipeline.
+- Nouveau, mineur : `doc = fitz.open(pdf_path)` (`:549`) n'est jamais fermé (`doc.close()` absent) — fuite de ressources mineure sur de gros PDF ou une longue session d'utilisation répétée de l'appli.
 
 ---
 
-## 4. Ce qui est bien fait
+## 3. Plan priorisé pour la suite (Étape C et au-delà)
 
-- Détection de Tesseract multiplateforme avec repli sur les chemins Windows standards (`configure_tesseract`, ligne 45) : pragmatique.
-- Aperçu visuel de la coupe avant de lancer tout le traitement (`preview_cut`, ligne 279) : bonne UX, permet de valider le réglage de gouttière page par page avant un run long.
-- Séparation claire des réglages Tesseract exposés (`--oem`, `--psm`) avec recommandations dans le README : utile et pédagogique, notamment la distinction `--psm 3` (maquette complexe, pertinent pour des articles à colonnes) vs `--psm 6` (page simple).
-- Gestion des plages de pages avec syntaxe `1-3,6,8-` (ligne 265) : couvre bien le besoin de ne traiter qu'un sous-ensemble d'un PDF.
-- Fallback de langue Tesseract (`eng`) en cas d'échec (ligne 378) : bonne intention, même si son implémentation devrait être plus défensive (cf. 3.3).
-- README très complet et didactique sur l'installation de Tesseract par OS.
+### Étape C — corrections ciblées, faible risque, fort impact (à faire en premier)
+1. **EXIF orientation** (§2.2) — `ImageOps.exif_transpose()` après chaque `Image.open()` en mode photo. Sans ça, le Mode photo peut échouer silencieusement sur de vraies photos de téléphone.
+2. **Réordonner le pipeline photo avant la découpe** (§2.3) — deskew + normalisation d'éclairage sur la page entière avant `split_double_page`, seuillage adaptatif seulement après découpe.
+3. **Griser le champ DPI en mode photo** (§2.6) — cohérence avec le reste de l'UI (déjà fait pour PDF/dossier).
+4. **Avertir explicitement sur les fichiers HEIC/HEIC ignorés** (§2.4) — message dans le journal si des `.heic`/`.heif` sont détectés dans le dossier mais non traités ; note README.
+5. **Ne pas réimposer `photo_mode_var=True` à chaque bascule** (§2.7) — l'activer une seule fois par défaut (ex. seulement si jamais modifié manuellement).
 
----
+Ces cinq points sont mécaniques, testables unitairement, et ne demandent pas de nouvelle dépendance.
 
-## 5. Recommandations priorisées
+### Étape D — réglages & confiance utilisateur (impact moyen, effort modéré)
+6. **Exposer `blur_radius`/`offset` du Mode photo dans l'UI** (§2.5), avec valeurs par défaut actuelles conservées.
+7. **Ajouter un bouton « Aperçu prétraitement »** montrant le résultat du Mode photo (image après deskew + illumination + seuillage) sur la première page/photo, sur le même principe que « Aperçu découpe ».
+8. **Rendre le reflow de paragraphes optionnel** (§2.8, hérité v1) — case à cocher, utile pour notes de bas de page/bibliographie/vers.
+9. **Tests unitaires** (pytest) pour les fonctions pures du module, en priorité les fonctions ajoutées à l'étape B (`estimate_skew_angle` sur image synthétique inclinée d'angle connu, `normalize_illumination` sur gradient connu, `natural_sort_key`) — protège contre les régressions avant de toucher à l'étape E.
 
-**Corrections rapides (peu de risque, fort impact) :**
-1. Ajouter `numpy` à `requirements_ocr.txt` (bug bloquant à l'usage par défaut).
-2. Protéger le fallback de langue (ligne 378-380) dans un `try/except` qui log et continue plutôt que de laisser remonter l'exception et perdre tout le batch.
-3. Écrire le TXT de façon incrémentale (ou sauvegarder un fichier partiel toutes les N pages) pour ne pas perdre un long traitement en cas d'erreur tardive.
-4. Documenter dans le README que l'app attend un PDF déjà "plat" et recommander explicitement une app de scan smartphone (avec recadrage/correction de perspective automatique) en amont — évite une déception à l'usage.
-
-**Améliorations structurantes pour l'usage "photo smartphone" (plus de travail, gain qualité important) :**
-5. Ajouter un import direct de photos (dossier de JPG/PNG triés) sans passer par un PDF intermédiaire.
-6. Ajouter une correction d'éclairage non uniforme (normalisation par flou gaussien large) avant seuillage, et passer à un seuillage adaptatif plutôt qu'Otsu global pour les images de type "photo".
-7. Ajouter un deskew (redressement fin, quelques degrés) avant OCR — gain de qualité significatif et peu coûteux à implémenter (recherche d'angle par variance de projection).
-8. Si la déformation de perspective/courbure est un problème constaté en pratique (à vérifier sur vos propres photos), envisager une détection des bords de page + correction de perspective (nécessiterait `opencv-python`, actuellement absent des dépendances).
-
-**Confort / fiabilité :**
-9. Rendre thread-safe les mises à jour d'UI depuis le worker (queue + `after`).
-10. Ajouter un bouton "Annuler" pour les traitements longs.
-11. Rendre le reflow de paragraphes (`postprocess_text`) optionnel via une case à cocher, utile pour les textes avec notes de bas de page/bibliographie.
+### Étape E — le vrai gain qualité restant (effort important, dépendance nouvelle)
+10. **Correction de perspective/courbure** (§2.1, le point le plus structurant depuis l'audit v1) : nécessite `opencv-python` (absent du projet). Deux approches possibles, à trancher avec vous avant de coder :
+    - **Détection automatique des 4 coins de page** (contour le plus grand détecté par `cv2.findContours` après un seuillage) + `cv2.getPerspectiveTransform`/`warpPerspective` — entièrement automatique mais fragile si le fond de la photo (table, tapis) a un contraste proche de la page.
+    - **Recadrage manuel assisté** : l'utilisateur clique les 4 coins de la page sur l'aperçu (comme pour Aperçu découpe), l'appli calcule la transformation — moins « magique » mais beaucoup plus fiable et plus simple à implémenter/tester.
+    Recommandation : commencer par l'option manuelle (moins de risque de régression, résultat prévisible), l'automatique pouvant venir en option plus tard.
+11. Si la courbure de reliure (page qui se creuse près du pli, indépendamment de la perspective globale) reste un problème après le point 10, envisager une correction de courbure locale (plus complexe, à évaluer seulement si le besoin est confirmé sur des photos réelles).
 
 ---
 
-## 6. Conclusion
+## 4. Recommandation de méthode
 
-Le code est correct et bien organisé pour ce qu'il fait — un pipeline PDF-scanné → OCR avec découpe de double page. Le vrai risque pour votre usage n'est pas un bug caché mais un **écart entre l'hypothèse implicite du pipeline (page plate, bien éclairée, déjà en PDF) et la réalité d'une photo de smartphone prise à main levée sur un livre ouvert**. Avant d'investir dans les réglages fins Tesseract (`--psm`, DPI), le plus gros gain de qualité viendra probablement d'une meilleure image en entrée : soit via une app de scan mobile qui fait déjà la correction de perspective/éclairage, soit en ajoutant ces étapes dans ce pipeline. Le bug `numpy` (§3.1) doit être corrigé indépendamment, car il bloque la fonctionnalité de découpe de double page activée par défaut.
+Avant d'attaquer l'étape E (perspective/courbure), il serait utile de **tester le pipeline actuel (post étape C/D) sur un petit lot de vraies photos** prises dans vos conditions réelles (main levée, éclairage de bureau, livre ouvert) pour vérifier empiriquement :
+- si le Mode photo (une fois les bugs §2.2/§2.3 corrigés) suffit déjà à obtenir un OCR exploitable ;
+- ou si la déformation de perspective/courbure est effectivement le facteur limitant, auquel cas l'effort de l'étape E est justifié.
+
+Cela évite d'investir dans OpenCV et une détection de coins si le gain réel s'avère faible une fois les bugs EXIF et l'ordre du pipeline corrigés.
